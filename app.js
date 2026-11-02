@@ -134,7 +134,55 @@ function watchedEps(it){
   let n = 0; for (let i=0;i<p.s-1 && i<S.length;i++) n += S[i];
   return n + (p.e||0);
 }
+function after(a, b){ return a.s > b.s || (a.s===b.s && a.e > b.e); }
+// Latest episode that has actually aired, or null when there's no air-date data (hand-added shows).
+function airedLimit(it){
+  if (it.type!=="tv") return null;
+  const T = todayISO();
+  const aired = [it.lastAir, it.nextAir].filter(x => x && x.date && x.date <= T && x.s);
+  if (aired.length) return aired.sort((a,b) => b.s-a.s || b.e-a.e).map(x => ({s:x.s, e:x.e}))[0];
+  if (it.showStatus==="upcoming" || (it.firstAir && it.firstAir > T)) return {s:1, e:0};
+  return null;
+}
+function capProgress(p, it){ const L = airedLimit(it); return L && after(p, L) ? {s:L.s, e:L.e} : p; }
+function airedEps(it){
+  const L = airedLimit(it); if (!L) return totalEps(it);
+  const S = it.seasons||[]; let n = 0; for (let i=0;i<L.s-1 && i<S.length;i++) n += S[i];
+  return n + L.e;
+}
+function isOut(it){
+  const T = todayISO();
+  if (it.type==="tv"){ const L = airedLimit(it); return !(L && L.s===1 && L.e===0); }
+  const th = it.releaseDate, dg = it.digitalDate;
+  if (th && th <= T) return true;
+  if (dg && dg <= T) return true;
+  if (th || dg) return false;
+  return it.showStatus !== "upcoming";
+}
+function outDate(it){
+  const T = todayISO();
+  const ds = it.type==="tv" ? [it.nextAir && it.nextAir.date, it.firstAir] : [it.releaseDate, it.digitalDate];
+  return ds.filter(d => d && d > T).sort()[0] || "";
+}
+function notOutMsg(it){ const d = outDate(it); return `${it.title} isn't out yet${d ? ` (${relDay(d)})` : ""}, so it's on Up next`; }
 function nextEp(it){
+  const n = rawNextEp(it); if (!n) return null;
+  const L = airedLimit(it); return L && after(n, L) ? null : n;
+}
+// Move progress to the latest aired episode. Returns false when there's no episode data to go on.
+function catchUp(it){
+  const S = it.seasons||[], L = airedLimit(it);
+  const target = L || (S.length ? {s:S.length, e:S[S.length-1]} : null);
+  if (!target || (target.s===1 && target.e===0)) return false;
+  it.progress = {s:target.s, e:target.e}; it.status = "watching"; delete it.newAt;
+  if (it.showStatus==="ended" && !rawNextEp(it)){ it.status = "watched"; it.finishedAt = Date.now(); }
+  return true;
+}
+function caughtUpToast(it){
+  if (it.status==="watched"){ if (it.rating==null) askRating(it); else toast(`Finished ${it.title}`); return; }
+  toast(`Caught up on ${it.title} through ${code(it.progress.s, it.progress.e)}`);
+}
+function rawNextEp(it){
   const S = it.seasons||[]; const p = it.progress||{s:1,e:0};
   if (!S.length) return {s:p.s||1, e:(p.e||0)+1};
   if ((p.e||0) < (S[p.s-1]||0)) return {s:p.s, e:(p.e||0)+1};
@@ -274,12 +322,14 @@ function makeItem(m, status, L){
   applyStatus(it, status); return it;
 }
 function applyStatus(it, status){
+  if ((status==="watched" || status==="watching") && !isOut(it)) status = "want";
   it.status = status;
+  if (!it.progress) it.progress = {s:1,e:0};
   if (status==="watched"){
     it.finishedAt = Date.now();
-    if (it.type==="tv" && it.seasons.length) it.progress = {s:it.seasons.length, e:it.seasons[it.seasons.length-1]};
+    if (it.type==="tv" && it.seasons.length) it.progress = capProgress({s:it.seasons.length, e:it.seasons[it.seasons.length-1]}, it);
   }
-  if (!it.progress) it.progress = {s:1,e:0};
+  return status;
 }
 function findIn(L, m){
   const t = m.type==="movie" ? "movie" : "tv", n = norm(m.title);
@@ -723,15 +773,18 @@ function cardHTML(it){
   let prog = "", acts = "";
   const isNew = it.newAt && Date.now() - it.newAt < 14*DAY && nextEp(it);
   if (it.type==="tv" && it.status==="watching"){
-    const tot = totalEps(it), done = watchedEps(it), n = nextEp(it);
+    const tot = airedEps(it), done = Math.min(watchedEps(it), tot || Infinity), n = nextEp(it);
     prog = `<div class="prog"><div class="bar"><i style="width:${tot ? Math.min(100, done/tot*100).toFixed(1) : 0}%"></i></div><span class="mono">${done}${tot ? " / " + tot : ""} eps</span></div>`;
     acts = n ? `${isNew ? `<span class="chip new">New episodes</span>` : ""}<button class="btn primary" data-action="next" data-id="${it.id}">Watched <span class="mono">${code(n.s,n.e)}</span></button>`
              : `<span class="chip c-watched"><span class="dot"></span>Caught up</span>`;
+    if (n) acts += `<button class="btn" data-action="caught-up" data-id="${it.id}">Caught up</button>`;
     acts += `<button class="btn ghost" data-action="finish" data-id="${it.id}">Finished</button>`;
   } else if (it.status==="watching"){
     acts = `<button class="btn primary" data-action="finish" data-id="${it.id}">Finished it</button>`;
   } else if (it.status==="want"){
-    acts = it.type==="tv" ? `<button class="btn" data-action="start" data-id="${it.id}">Start watching</button><button class="btn ghost" data-action="finish" data-id="${it.id}">Seen it</button>` : `<button class="btn" data-action="finish" data-id="${it.id}">Watched it</button>`;
+    if (!isOut(it)) acts = "";
+    else if (it.type==="tv") acts = `<button class="btn" data-action="start" data-id="${it.id}">Start watching</button>${it.showStatus==="returning" ? `<button class="btn" data-action="caught-up" data-id="${it.id}">Caught up</button>` : ""}<button class="btn ghost" data-action="finish" data-id="${it.id}">Seen it</button>`;
+    else acts = `<button class="btn" data-action="finish" data-id="${it.id}">Watched it</button>`;
   } else if (it.status==="watched"){
     acts = (isNew ? `<button class="btn ghost" data-action="start" data-id="${it.id}">New season · resume</button>` : "") + ratingChip(it);
   } else {
@@ -851,7 +904,7 @@ function addHTML(s){
           ${r.overview ? `<p class="overview clamp">${esc(r.overview)}</p>` : ""}
           <div class="acts">${ex ? `<button class="btn ghost" data-action="open" data-id="${ex.id}">On ${LIST_NAME[st.list]} · ${STATUS_LABEL[ex.status]}</button>${ex.status!=="want" ? rateRow(ex) : ""}`
             : s.adding===i ? loading("Adding…")
-            : `<span class="lbl" style="margin:0;width:100%">Add as</span>` + ["watched","watching","want"].map(k=>`<button class="btn" data-action="add-result" data-idx="${i}" data-status="${k}">${k==="watched" ? "Seen it" : STATUS_LABEL[k]}</button>`).join("")}</div>
+            : `<span class="lbl" style="margin:0;width:100%">Add as</span>` + (r.type==="tv" ? ["watched","caughtup","watching","want"] : ["watched","watching","want"]).map(k=>`<button class="btn" data-action="add-result" data-idx="${i}" data-status="${k}">${k==="watched" ? "Seen it" : k==="caughtup" ? "Caught up" : STATUS_LABEL[k]}</button>`).join("")}</div>
         </div></div>`; }).join("")}</div>`;
     }
   } else if (s.mode==="bulk"){
@@ -892,15 +945,17 @@ function detailHTML(it, s, L){
     ${it.overview ? `<p class="overview">${esc(it.overview)}</p>` : ""}</div></div>
     ${kv.length ? `<dl class="kv">${kv.map(([k,v])=>`<dt>${k}</dt><dd>${esc(v)}</dd>`).join("")}</dl>` : ""}
     <hr>
-    <div><span class="lbl">List</span><div class="seg" role="group" aria-label="List">${["want","watching","watched","dropped"].map(k=>`<button class="chipbtn" data-action="set-status" data-id="${it.id}" data-status="${k}" aria-pressed="${it.status===k}">${STATUS_LABEL[k]}</button>`).join("")}</div></div>
+    <div><span class="lbl">List</span><div class="seg" role="group" aria-label="List">${["want","watching","watched","dropped"].map(k=>`<button class="chipbtn" data-action="set-status" data-id="${it.id}" data-status="${k}" aria-pressed="${it.status===k}" ${!isOut(it) && (k==="watching"||k==="watched") ? "disabled" : ""}>${STATUS_LABEL[k]}</button>`).join("")}</div>${!isOut(it) ? `<p class="note" style="margin-top:6px">Not out yet${outDate(it) ? `. Out ${relDay(outDate(it))}` : ""}. You can mark it once it's released.</p>` : ""}</div>
     <div><span class="lbl">Your rating${L==="ours" ? " (shared)" : ""}</span>${rateRow(it)}</div>`;
   if (it.type==="tv" && it.status!=="want"){
     const S = it.seasons, p = it.progress||{s:1,e:0}, n = nextEp(it);
-    const sCount = Math.max(S.length, p.s, 1), eMax = S[p.s-1] || Math.max(p.e+5, 10);
+    const lim = airedLimit(it);
+    const sCount = lim ? Math.max(lim.s, 1) : Math.max(S.length, p.s, 1);
+    const eMax = lim && p.s===lim.s ? lim.e : (S[p.s-1] || Math.max(p.e+5, 10));
     h += `<div><span class="lbl">Episode progress · optional</span>
       <div class="selrow"><select id="pS" data-id="${it.id}" aria-label="Season">${Array.from({length:sCount},(_,i)=>`<option value="${i+1}" ${p.s===i+1?"selected":""}>Season ${i+1}</option>`).join("")}</select>
       <select id="pE" data-id="${it.id}" aria-label="Episode">${Array.from({length:eMax+1},(_,i)=>`<option value="${i}" ${p.e===i?"selected":""}>${i===0?"Not started":"Episode "+i}</option>`).join("")}</select></div>
-      <div class="row" style="margin-top:10px">${n ? `<button class="btn" data-action="next" data-id="${it.id}">Watched <span class="mono">${code(n.s,n.e)}</span></button>${S[n.s-1] && n.e < S[n.s-1] ? `<button class="btn" data-action="season-done" data-id="${it.id}">Finished season ${n.s}</button>` : ""}` : `<span class="chip c-watched"><span class="dot"></span>Caught up</span>`}
+      <div class="row" style="margin-top:10px">${n ? `<button class="btn" data-action="next" data-id="${it.id}">Watched <span class="mono">${code(n.s,n.e)}</span></button>${S[n.s-1] && n.e < S[n.s-1] ? `<button class="btn" data-action="season-done" data-id="${it.id}">Finished season ${n.s}</button>` : ""}<button class="btn" data-action="caught-up" data-id="${it.id}">Caught up</button>` : `<span class="chip c-watched"><span class="dot"></span>Caught up</span>`}
       <span class="mono note">${watchedEps(it)}${totalEps(it) ? " / " + totalEps(it) : ""} episodes</span></div></div>`;
   }
   h += `<div><span class="lbl">Where to watch</span>${s.editWhere || !ps.length
@@ -986,13 +1041,20 @@ const A = {
   "add-mode": el => { st.sheet.mode = el.dataset.mode; st.sheet.err = ""; renderSheet(); focusFirst(); },
   "open": (el,id) => openSheet({kind:"detail", id}),
   "next": (el,id) => markNext(id),
-  "start": (el,id) => { const L = listOf(id), it = clean(st.lists[L][id]); applyStatus(it,"watching"); upsert(it, L); toast(`Started ${it.title}`); },
-  "finish": (el,id) => { const L = listOf(id), it = clean(st.lists[L][id]); applyStatus(it,"watched"); delete it.newAt; upsert(it, L); if (it.rating==null) askRating(it); else toast(`Marked ${it.title} watched`); },
+  "start": (el,id) => { const L = listOf(id), it = clean(st.lists[L][id]); if (applyStatus(it,"watching")!=="watching"){ toast(notOutMsg(it)); return; } upsert(it, L); toast(`Started ${it.title}`); },
+  "finish": (el,id) => { const L = listOf(id), it = clean(st.lists[L][id]); if (applyStatus(it,"watched")!=="watched"){ toast(notOutMsg(it)); return; } delete it.newAt; upsert(it, L); if (it.rating==null) askRating(it); else toast(`Marked ${it.title} watched`); },
+  "caught-up": (el,id) => {
+    const L = listOf(id), it = clean(st.lists[L][id]);
+    if (!isOut(it)){ toast(notOutMsg(it)); return; }
+    if (!catchUp(it)){ toast("No episode info for this show yet. Open it and tap Refresh details."); return; }
+    upsert(it, L); caughtUpToast(it);
+  },
   "season-done": (el,id) => {
     const L = listOf(id), it = clean(st.lists[L][id]); const n = nextEp(it); if (!n || !it.seasons[n.s-1]) return;
-    it.progress = {s:n.s, e:it.seasons[n.s-1]}; it.status = "watching"; upsert(it, L); toast(`Finished season ${n.s}`);
+    it.progress = capProgress({s:n.s, e:it.seasons[n.s-1]}, it); it.status = "watching"; upsert(it, L);
+    toast(it.progress.e===it.seasons[n.s-1] ? `Finished season ${n.s}` : `Caught up through ${code(it.progress.s,it.progress.e)}`);
   },
-  "set-status": (el,id) => { const L = listOf(id), it = clean(st.lists[L][id]); const k = el.dataset.status; if (it.status===k) return; applyStatus(it,k); upsert(it, L); },
+  "set-status": (el,id) => { const L = listOf(id), it = clean(st.lists[L][id]); const k = el.dataset.status; if (it.status===k) return; if (applyStatus(it,k)!==k){ toast(notOutMsg(it)); return; } upsert(it, L); },
   "rate": (el,id) => {
     const L = listOf(id), it = clean(st.lists[L][id]); const v = +el.dataset.v;
     const fromPrompt = st.sheet && st.sheet.kind==="rate";
@@ -1041,7 +1103,10 @@ const A = {
   "add-result": async el => {
     const s = st.sheet; const i = +el.dataset.idx; const r = s.results[i]; const k = el.dataset.status;
     s.adding = i; renderSheet();
-    try { const m = await details(r.type, r.tmdbId); const it = addFromMeta(m, k); toast(`${it.title} added to ${STATUS_LABEL[it.status]}`); }
+    try { const m = await details(r.type, r.tmdbId); if (k==="caughtup"){
+        if (!isOut(m)){ const it = addFromMeta(m, "want"); toast(notOutMsg(it)); }
+        else { const ex = findExisting(m); const it = clean(ex || makeItem(m, "watching", st.list)); if (catchUp(it)){ upsert(it, ex ? listOf(it.id) : st.list); caughtUpToast(it); } else { upsert(it, ex ? listOf(it.id) : st.list); toast(`${it.title} added to Watching`); } }
+      } else { const it = addFromMeta(m, k); toast(it.status!==k && k!=="want" && !isOut(it) ? notOutMsg(it) : `${it.title} added to ${STATUS_LABEL[it.status]}`); } }
     catch(e){ s.err = tmdbErr(e); }
     s.adding = null; if (st.sheet===s) renderSheet();
   },
@@ -1051,7 +1116,7 @@ const A = {
     const lines = (s.bulk||"").split(/\n|;/).map(x=>x.trim()).filter(Boolean);
     if (!lines.length){ s.err = "Add at least one title, one per line."; renderSheet(); return; }
     const batch = lines.slice(0,60); s.loading = true; s.err = ""; s.result = ""; s.count = batch.length; s.done = 0; renderSheet();
-    let added = 0, dup = 0; const miss = [];
+    let added = 0, dup = 0, early = 0; const miss = [];
     try {
       await pool(batch, 3, async line => {
         let m = null;
@@ -1059,10 +1124,10 @@ const A = {
         s.done++; if (st.sheet===s) renderSheet();
         if (!m){ miss.push(line); return; }
         if (findIn(L, m)){ dup++; return; }
-        const it = makeItem(m, s.bulkStatus, L); st.lists[L][it.id] = it; backend.saveItem(it, L); added++;
+        const it = makeItem(m, s.bulkStatus, L); if (it.status!==s.bulkStatus) early++; st.lists[L][it.id] = it; backend.saveItem(it, L); added++;
       });
       s.bulk = lines.slice(60).join("\n");
-      s.result = `Added ${added}.` + (dup ? ` Skipped ${dup} already on your list.` : "") + (miss.length ? ` Couldn't find: ${miss.join(", ")}.` : "") + (lines.length > 60 ? ` ${lines.length-60} lines left to add.` : "");
+      s.result = `Added ${added}.` + (dup ? ` Skipped ${dup} already on your list.` : "") + (early ? ` ${early} not out yet went to Up next.` : "") + (miss.length ? ` Couldn't find: ${miss.join(", ")}.` : "") + (lines.length > 60 ? ` ${lines.length-60} lines left to add.` : "");
       if (added && s.bulkStatus!=="watching"){ st.tab = s.bulkStatus; lsSet("wl.tab", st.tab); }
     } catch(e){ s.err = tmdbErr(e); }
     s.loading = false; render(true);
@@ -1117,7 +1182,7 @@ const A = {
   },
   "rec-add": el => {
     const src = el.dataset.src === "fresh" ? st.fresh : (st.picks[st.list]||{}).items; const r = src && src[+el.dataset.idx]; if (!r) return;
-    const it = addFromMeta(r, el.dataset.status); toast(`${it.title} added to ${STATUS_LABEL[it.status]}`);
+    const k = el.dataset.status; const it = addFromMeta(r, k); toast(it.status!==k && !isOut(it) ? notOutMsg(it) : `${it.title} added to ${STATUS_LABEL[it.status]}`);
   },
   "rec-dismiss": el => {
     const fresh = el.dataset.src==="fresh"; const arr = fresh ? st.fresh : (st.picks[st.list]||{}).items; const i = +el.dataset.idx; const r = arr && arr[i]; if (!r) return;
@@ -1223,7 +1288,7 @@ document.addEventListener("change", e => {
     const L = listOf(t.dataset.id), it = clean(st.lists[L][t.dataset.id]);
     const s = +$("pS").value; let ep = +$("pE").value;
     if (t.id==="pS") ep = Math.min(ep, it.seasons[s-1] || ep);
-    it.progress = {s, e:ep};
+    it.progress = capProgress({s, e:ep}, it);
     if (it.status==="want") it.status = "watching";
     upsert(it, L);
   }
