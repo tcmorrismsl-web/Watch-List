@@ -252,11 +252,17 @@ async function genreNames(){
   return genreIdx;
 }
 let provIdx = null;
+// TMDB provider ids for rent/buy storefronts: Apple TV store, Google Play, Fandango at Home, Amazon Video,
+// Microsoft Store, YouTube (store), Rakuten, Redbox, Spectrum On Demand.
+const STORE_IDS = new Set([2, 3, 7, 10, 68, 192, 35, 279, 486]);
+const STORE_RE = /^(apple tv store|itunes|amazon video|google play|fandango|vudu|microsoft store|redbox|rakuten)/i;
+function isStore(p){ return STORE_IDS.has(p.provider_id) || STORE_RE.test(p.provider_name||""); }
+function streamable(x){ return platsOf(x).some(p => !["Rent or buy","In theaters"].includes(p)); }
 async function providerIds(names){
   if (!provIdx){
     const [a,b] = await Promise.all([tmdb("/watch/providers/tv",{watch_region:"US"}), tmdb("/watch/providers/movie",{watch_region:"US"})]);
     provIdx = {};
-    [...(a.results||[]), ...(b.results||[])].forEach(p => { const n = normProvider(p.provider_name); (provIdx[n] = provIdx[n] || new Set()).add(p.provider_id); });
+    [...(a.results||[]), ...(b.results||[])].filter(p => !isStore(p)).forEach(p => { const n = normProvider(p.provider_name); (provIdx[n] = provIdx[n] || new Set()).add(p.provider_id); });
   }
   const ids = new Set(); names.forEach(n => (provIdx[n]||[]).forEach(i => ids.add(i)));
   return [...ids];
@@ -271,7 +277,7 @@ function toMeta(type, d){
     while (seasons.length && !seasons[seasons.length-1]) seasons.pop();
   }
   const wp = ((d["watch/providers"]||{}).results||{}).US || {};
-  const order = [...(wp.flatrate||[]), ...(wp.free||[]), ...(wp.ads||[])].sort((a,b)=>(a.display_priority||99)-(b.display_priority||99));
+  const order = [...(wp.flatrate||[]), ...(wp.free||[]), ...(wp.ads||[])].filter(p => !isStore(p)).sort((a,b)=>(a.display_priority||99)-(b.display_priority||99));
   let platforms = [...new Set(order.map(p => normProvider(p.provider_name)).filter(Boolean))];
   if (!platforms.length && (wp.rent || wp.buy)) platforms = ["Rent or buy"];
   if (!tv && !platforms.length && date && (Date.now() - new Date(date).getTime()) < 75*DAY && Date.now() > new Date(date).getTime()) platforms = ["In theaters"];
@@ -601,7 +607,7 @@ async function buildPicks(){
   }
   const top = [...cands.values()].sort((a,b) => b.score-a.score).slice(0,24);
   await pool(top, 5, async c => { try { c.meta = await details(c.type, c.r.id); } catch(e){} });
-  let out = top.filter(c => c.meta);
+  let out = top.filter(c => c.meta && streamable(c.meta));
   const svc = p.services || [];
   if (svc.length){
     out.forEach(c => { if (c.meta.platforms.some(x => svc.includes(x))) c.score += 1; });
@@ -626,9 +632,9 @@ async function buildFresh(){
   }).then(d => (d.results||[]).map(r => ({...r, media_type:t})))));
   const merged = []; for (let i=0;i<20;i++) lists.forEach(l => { if (l[i]) merged.push(l[i]); });
   const dis = new Set(p.dismissed||[]);
-  const pick = merged.filter(r => !inAnyList(r.media_type, r.id) && !dis.has(r.media_type + ":" + r.id)).slice(0,10);
+  const pick = merged.filter(r => !inAnyList(r.media_type, r.id) && !dis.has(r.media_type + ":" + r.id)).slice(0,16);
   const metas = await pool(pick, 5, async r => { try { return await details(r.media_type, r.id); } catch(e){ return null; } });
-  return metas.filter(Boolean);
+  return metas.filter(m => m && platsOf(m).some(x => svc.includes(x))).slice(0,10);
 }
 function savePicksLocal(){ lsSet("wl.picks", JSON.stringify(st.picks)); }
 
@@ -983,13 +989,22 @@ async function browse(s, append){
       if (s.bcat==="Anime") params.with_original_language = "ja";
       if (s.bcat==="Animation") params.without_keywords = "210024"; // TMDB's "anime" keyword
     }
-    const d = await tmdb(`/discover/${s.btype}`, params);
-    if (reqId !== s.reqId) return;
-    const rows = (d.results||[]).map(r => ({tmdbId:r.id, type:s.btype, title: tv ? r.name : r.title,
-      year: +((r.first_air_date||r.release_date||"").slice(0,4)) || null, poster:r.poster_path||"", overview:str(r.overview,400)}));
+    // TMDB's service filter also lets through titles that are only for rent, so check each one.
     const prev = append ? (s.results||[]) : [];
-    s.results = [...prev, ...rows.filter(x => !prev.some(y => y.tmdbId===x.tmdbId))];
-    s.page = page; s.more = page < Math.min(d.total_pages||1, 30);
+    const kept = [];
+    let pg = page, total = 1;
+    do {
+      const d = await tmdb(`/discover/${s.btype}`, {...params, page:pg});
+      if (reqId !== s.reqId) return;
+      total = Math.min(d.total_pages||1, 40);
+      const fresh = (d.results||[]).filter(r => !prev.some(y => y.tmdbId===r.id) && !kept.some(y => y.tmdbId===r.id));
+      const metas = await pool(fresh, 6, async r => { try { return await details(s.btype, r.id); } catch(e){ if (e.code==="badkey"||e.code==="offline") throw e; return null; } });
+      if (reqId !== s.reqId) return;
+      metas.forEach(m => { if (m && platsOf(m).includes(s.bsvc)) kept.push(m); });
+      s.page = pg; pg++;
+    } while (kept.length < 10 && pg <= total && pg < page + 4);
+    s.results = [...prev, ...kept];
+    s.more = s.page < total;
   } catch(e){ if (e.code!=="skip") s.err = e.code==="noprov" ? `TMDB doesn't list ${s.bsvc} in the US.` : tmdbErr(e); }
   if (reqId === s.reqId){ s.loading = false; if (st.sheet===s) renderSheet(); }
 }
