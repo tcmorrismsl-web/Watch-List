@@ -26,7 +26,7 @@ const PLAT_COLOR = Object.fromEntries(PLATFORMS);
 const SERVICE_CHOICES = PLATFORMS.slice(0, 21).map(p => p[0]);
 const PROV_RULES = [
   [/^netflix/i,"Netflix"],[/^(hbo )?max\b|^hbo max|^hbo now/i,"HBO Max"],[/^hulu/i,"Hulu"],[/^disney/i,"Disney+"],
-  [/^(amazon )?prime video|^amazon freevee|^freevee/i,"Prime Video"],[/^apple tv/i,"Apple TV"],[/^peacock/i,"Peacock"],
+  [/^(amazon )?prime video( with ads)?$|^amazon freevee|^freevee/i,"Prime Video"],[/^apple tv(\s?(\+|plus))?( amazon channel)?$/i,"Apple TV"],[/^peacock/i,"Peacock"],
   [/^paramount|^showtime/i,"Paramount+"],[/^starz/i,"Starz"],[/^amc\s?(\+|plus)/i,"AMC+"],[/^mgm/i,"MGM+"],
   [/^discovery\s?(\+|plus)/i,"Discovery+"],[/^crunchyroll/i,"Crunchyroll"],[/^britbox/i,"BritBox"],[/^acorn/i,"Acorn TV"],
   [/^shudder/i,"Shudder"],[/^bet\s?(\+|plus)/i,"BET+"],[/^tubi/i,"Tubi"],[/^pluto/i,"Pluto TV"],[/^the roku channel|^roku channel/i,"Roku Channel"],
@@ -290,7 +290,7 @@ function toMeta(type, d){
     tmdbId:d.id, type, title: tv ? d.name : d.title, year: +date.slice(0,4) || null,
     endYear: tv && st8==="ended" && d.last_air_date ? +d.last_air_date.slice(0,4) : null,
     genres: mapTmdbGenres((d.genres||[]).map(g=>g.name), type, d.original_language),
-    platforms, providerLink: wp.link || "",
+    platforms, providerLink: wp.link || "", subIds: order.map(p => p.provider_id),
     network: tv ? (d.networks||[]).map(n=>n.name).slice(0,2).join(", ") : ((d.production_companies||[])[0]||{}).name || "",
     people: [...lead, ...cast].join(", "),
     overview: str(d.overview, 600), showStatus: st8,
@@ -973,7 +973,7 @@ async function browse(s, append){
   s.loading = true; s.err = ""; if (!append){ s.results = null; s.page = 0; } renderSheet();
   const reqId = s.reqId = (s.reqId||0) + 1;
   try {
-    const ids = await providerIds([s.bsvc]);
+    const ids = await providerIds([s.bsvc]); s.bids = ids;
     if (!ids.length) throw {code:"noprov"};
     const tv = s.btype==="tv", T = todayISO();
     const params = {watch_region:"US", with_watch_providers:ids.join("|"), with_watch_monetization_types:"flatrate|free|ads", language:"en-US", page};
@@ -1000,7 +1000,7 @@ async function browse(s, append){
       const fresh = (d.results||[]).filter(r => !prev.some(y => y.tmdbId===r.id) && !kept.some(y => y.tmdbId===r.id));
       const metas = await pool(fresh, 6, async r => { try { return await details(s.btype, r.id); } catch(e){ if (e.code==="badkey"||e.code==="offline") throw e; return null; } });
       if (reqId !== s.reqId) return;
-      metas.forEach(m => { if (m && platsOf(m).includes(s.bsvc)) kept.push(m); });
+      metas.forEach(m => { if (m && (m.subIds||[]).some(id => ids.includes(id))) kept.push(m); });
       s.page = pg; pg++;
     } while (kept.length < 10 && pg <= total && pg < page + 4);
     s.results = [...prev, ...kept];
