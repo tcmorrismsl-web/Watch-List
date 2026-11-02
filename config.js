@@ -5,10 +5,10 @@ window.WATCHLIST_CONFIG = {
   // These values are meant to be public; your Firestore rules are what protect your data.
   // Leave them blank and the app still works, saving to one browser only.
   firebase: {
-    apiKey: "",
-    authDomain: "",
-    projectId: "",
-    appId: ""
+    apiKey: "AIzaSyAPKFsLT_0UW1WSwoe8PUe2toeFXtQtlHU",
+    authDomain: "watch-list-3176e.firebaseapp.com",
+    projectId: "watch-list-3176e",
+    appId: "1:195356349675:web:1965ae6d725b45836c9aae"
   },
 
   // Optional. Leave blank and paste your TMDB key in the app's Settings instead,
