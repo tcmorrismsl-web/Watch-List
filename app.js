@@ -704,7 +704,7 @@ function renderMain(){
       `<button class="btn primary" data-action="open-add">Add a title</button>`);
     else if (none) html += emptyBlock("Start with what you've seen",
       "Paste a list of shows and movies you've already watched and Watch List fills in posters, seasons, categories and where each one streams. The more you log and rate, the better the picks under For you.",
-      `<button class="btn primary" data-action="open-add" data-mode="bulk">Paste a list</button><button class="btn" data-action="open-add" data-mode="search">Search a title</button>`);
+      `<button class="btn primary" data-action="open-add" data-mode="browse">Browse a service</button><button class="btn" data-action="open-add" data-mode="bulk">Paste a list</button><button class="btn" data-action="open-add" data-mode="search">Search a title</button>`);
     else html += emptyBlock("Nothing in progress", filtered ? filt : "Start something from Up next, or add a show you're partway through.",
       `<button class="btn" data-action="tab" data-tab="want">See Up next</button><button class="btn" data-action="open-add">Add a title</button>`);
   } else if (st.tab==="want"){
@@ -719,7 +719,7 @@ function renderMain(){
       if (unrated) html += `<p class="note">${unrated} unrated. Ratings are what For you learns from most.</p>`;
       html += list(arr);
     } else html += emptyBlock("Nothing logged yet", filtered ? filt : "Log what you've already seen, a whole list at a time.",
-      filtered ? "" : `<button class="btn primary" data-action="open-add" data-mode="bulk">Paste a list</button>`);
+      filtered ? "" : `<button class="btn primary" data-action="open-add" data-mode="browse">Browse a service</button><button class="btn" data-action="open-add" data-mode="bulk">Paste a list</button>`);
     if (dr.length) html += `<section><p class="sub">Dropped</p>${list(dr)}</section>`;
   }
   main.innerHTML = html + footHTML();
@@ -884,9 +884,81 @@ function renderSheet(){
   } else if (s.kind==="settings"){ sheet.setAttribute("aria-label", "Settings"); sheet.innerHTML = settingsHTML(s); }
   else { sheet.setAttribute("aria-label", "Add a title"); sheet.innerHTML = addHTML(s); }
 }
+function resultsHTML(s, hideListed){
+  const touched = s.touched || new Set();
+  let shown = 0;
+  const rows = s.results.map((r,i) => {
+    const ex = findExisting(r);
+    if (hideListed && ex && !touched.has(r.type + ":" + r.tmdbId)) return "";
+    shown++;
+    return `<div class="res">${poster(r)}<div class="body"><h3>${esc(r.title)}</h3>
+      <p class="meta">${[r.year, r.type==="movie" ? "Film" : "TV series"].filter(Boolean).join(" · ")}</p>
+      ${r.overview ? `<p class="overview clamp">${esc(r.overview)}</p>` : ""}
+      <div class="acts">${ex ? `<button class="btn ghost" data-action="open" data-id="${ex.id}">On ${LIST_NAME[st.list]} · ${STATUS_LABEL[ex.status]}</button>${ex.status!=="want" ? rateRow(ex) : ""}`
+        : s.adding===i ? loading("Adding…")
+        : `<span class="lbl" style="margin:0;width:100%">Add as</span>` + (r.type==="tv" ? ["watched","caughtup","watching","want"] : ["watched","watching","want"]).map(k=>`<button class="btn" data-action="add-result" data-idx="${i}" data-status="${k}">${k==="watched" ? "Seen it" : k==="caughtup" ? "Caught up" : STATUS_LABEL[k]}</button>`).join("")}</div>
+    </div></div>`;
+  }).join("");
+  return `<div>${rows}</div>` + (hideListed && !shown && s.results.length ? `<p class="note">Everything here is already on your list. Tap Load more.</p>` : "");
+}
+const BROWSE_CATS = {
+  tv:["Drama","Comedy","Reality TV","Docuseries","Crime","Mystery","Sci-Fi","Fantasy","Action","Animation","Anime","Family","Talk show","War","Western"],
+  movie:["Drama","Comedy","Documentary","Crime","Thriller","Mystery","Sci-Fi","Fantasy","Action","Horror","Animation","Anime","Romance","Family","History","Music","War","Western"]
+};
+function browseHTML(s){
+  const svcs = [...new Set([...(st.profile.services||[]), ...SERVICE_CHOICES])].filter(x => !["Cable / live TV","Rent or buy","In theaters","YouTube"].includes(x));
+  s.bsvc = s.bsvc || svcs[0]; s.btype = s.btype || "tv"; s.bsort = s.bsort || "pop"; if (s.bhide == null) s.bhide = true;
+  const cats = BROWSE_CATS[s.btype];
+  let h = `<div class="field"><span class="lbl">Service</span><div class="scroller">${svcs.map(v=>`<button class="chipbtn" data-action="b-svc" data-v="${esc(v)}" aria-pressed="${s.bsvc===v}"><i class="sw" style="--c:${PLAT_COLOR[v]||"#8A8F9C"}"></i>${esc(v)}</button>`).join("")}</div></div>
+    <div class="row">
+      <div class="seg" role="group" aria-label="Shows or movies">${[["tv","Shows"],["movie","Movies"]].map(([k,l])=>`<button class="chipbtn" data-action="b-type" data-v="${k}" aria-pressed="${s.btype===k}">${l}</button>`).join("")}</div>
+      <div class="seg" role="group" aria-label="Sort">${[["pop","Popular"],["top","Top rated"],["new","Newest"]].map(([k,l])=>`<button class="chipbtn" data-action="b-sort" data-v="${k}" aria-pressed="${s.bsort===k}">${l}</button>`).join("")}</div>
+    </div>
+    <div class="row"><div class="grow"><select id="bCat" aria-label="Category"><option value="">All categories</option>${cats.map(c=>`<option value="${esc(c)}" ${s.bcat===c?"selected":""}>${esc(c)}</option>`).join("")}</select></div>
+      <label class="check" for="bHide"><input type="checkbox" id="bHide" ${s.bhide?"checked":""}>Hide what's on my list</label></div>`;
+  if (s.err) h += `<p class="err">${esc(s.err)}</p>`;
+  if (s.results) {
+    if (!s.results.length && !s.loading) h += `<p class="note">Nothing on ${esc(s.bsvc)} matches that. Try another category.</p>`;
+    else h += resultsHTML(s, s.bhide);
+  }
+  if (s.loading) h += loading(s.results ? "Loading more…" : `Loading ${esc(s.bsvc)}…`);
+  else if (s.results && s.more) h += `<button class="btn" style="align-self:flex-start" data-action="b-more">Load more</button>`;
+  return h;
+}
+async function browse(s, append){
+  const page = append ? (s.page||1) + 1 : 1;
+  s.loading = true; s.err = ""; if (!append){ s.results = null; s.page = 0; } renderSheet();
+  const reqId = s.reqId = (s.reqId||0) + 1;
+  try {
+    const ids = await providerIds([s.bsvc]);
+    if (!ids.length) throw {code:"noprov"};
+    const tv = s.btype==="tv", T = todayISO();
+    const params = {watch_region:"US", with_watch_providers:ids.join("|"), with_watch_monetization_types:"flatrate|free|ads", language:"en-US", page};
+    if (s.bsort==="top"){ params.sort_by = "vote_average.desc"; params["vote_count.gte"] = tv ? 150 : 500; }
+    else if (s.bsort==="new"){ params.sort_by = tv ? "first_air_date.desc" : "primary_release_date.desc"; params[tv ? "first_air_date.lte" : "primary_release_date.lte"] = T; params["vote_count.gte"] = tv ? 5 : 20; }
+    else { params.sort_by = "popularity.desc"; params["vote_count.gte"] = tv ? 20 : 50; }
+    if (s.bcat){
+      const G = await genreNames();
+      const want = s.bcat==="Anime" ? "Animation" : s.bcat;
+      const gids = Object.entries(G[s.btype]).filter(([,name]) => mapTmdbGenres([name], s.btype, "").includes(want)).map(([id]) => id);
+      if (!gids.length){ s.results = []; s.more = false; throw {code:"skip"}; }
+      params.with_genres = gids.join("|");
+      if (s.bcat==="Anime") params.with_original_language = "ja";
+      if (s.bcat==="Animation") params.without_keywords = "210024"; // TMDB's "anime" keyword
+    }
+    const d = await tmdb(`/discover/${s.btype}`, params);
+    if (reqId !== s.reqId) return;
+    const rows = (d.results||[]).map(r => ({tmdbId:r.id, type:s.btype, title: tv ? r.name : r.title,
+      year: +((r.first_air_date||r.release_date||"").slice(0,4)) || null, poster:r.poster_path||"", overview:str(r.overview,400)}));
+    const prev = append ? (s.results||[]) : [];
+    s.results = [...prev, ...rows.filter(x => !prev.some(y => y.tmdbId===x.tmdbId))];
+    s.page = page; s.more = page < Math.min(d.total_pages||1, 30);
+  } catch(e){ if (e.code!=="skip") s.err = e.code==="noprov" ? `TMDB doesn't list ${s.bsvc} in the US.` : tmdbErr(e); }
+  if (reqId === s.reqId){ s.loading = false; if (st.sheet===s) renderSheet(); }
+}
 function addHTML(s){
   const hasKey = !!tmdbKey();
-  const modes = hasKey ? [["search","Search"],["bulk","Paste a list"],["manual","By hand"]] : [["manual","By hand"]];
+  const modes = hasKey ? [["search","Search"],["browse","Browse services"],["bulk","Paste a list"],["manual","By hand"]] : [["manual","By hand"]];
   if (!hasKey) s.mode = "manual";
   let h = `<div class="sheet-head"><h2>Add to ${LIST_NAME[st.list]}</h2><button class="x" data-action="close-sheet" aria-label="Close">×</button></div>
     <div class="seg" role="group" aria-label="How to add">${modes.map(([k,l])=>`<button class="chipbtn" data-action="add-mode" data-mode="${k}" aria-pressed="${s.mode===k}">${l}</button>`).join("")}</div>`;
@@ -897,16 +969,10 @@ function addHTML(s){
     if (s.loading) h += loading("Searching…");
     if (s.results && !s.loading){
       if (!s.results.length) h += `<p class="note">No matches. Try another spelling, or add it by hand.</p>`;
-      h += `<div>${s.results.map((r,i) => {
-        const ex = findExisting(r);
-        return `<div class="res">${poster(r)}<div class="body"><h3>${esc(r.title)}</h3>
-          <p class="meta">${[r.year, r.type==="movie" ? "Film" : "TV series"].filter(Boolean).join(" · ")}</p>
-          ${r.overview ? `<p class="overview clamp">${esc(r.overview)}</p>` : ""}
-          <div class="acts">${ex ? `<button class="btn ghost" data-action="open" data-id="${ex.id}">On ${LIST_NAME[st.list]} · ${STATUS_LABEL[ex.status]}</button>${ex.status!=="want" ? rateRow(ex) : ""}`
-            : s.adding===i ? loading("Adding…")
-            : `<span class="lbl" style="margin:0;width:100%">Add as</span>` + (r.type==="tv" ? ["watched","caughtup","watching","want"] : ["watched","watching","want"]).map(k=>`<button class="btn" data-action="add-result" data-idx="${i}" data-status="${k}">${k==="watched" ? "Seen it" : k==="caughtup" ? "Caught up" : STATUS_LABEL[k]}</button>`).join("")}</div>
-        </div></div>`; }).join("")}</div>`;
+      h += resultsHTML(s, false);
     }
+  } else if (s.mode==="browse"){
+    h += browseHTML(s);
   } else if (s.mode==="bulk"){
     s.bulkStatus = s.bulkStatus || "watched";
     h += `<div class="field"><label for="bulk">One title per line</label><textarea id="bulk" rows="7" placeholder="Breaking Bad&#10;The Bear&#10;Dune: Part Two&#10;Love Is Blind">${esc(s.bulk||"")}</textarea></div>
@@ -1036,9 +1102,20 @@ const A = {
   "tab": el => { st.tab = el.dataset.tab; lsSet("wl.tab", st.tab); if (st.sheet) closeSheet(); render(true); window.scrollTo({top:0}); },
   "list": el => { st.list = el.dataset.l; lsSet("wl.list", st.list); st.cat = ""; st.plat = ""; lsSet("wl.cat",""); lsSet("wl.plat",""); render(true); window.scrollTo({top:0}); },
   "settings": () => openSheet({kind:"settings"}),
-  "open-add": el => { openSheet({kind:"add", mode: tmdbKey() ? (el.dataset.mode||"search") : "manual"}); focusFirst(); },
+  "open-add": el => {
+    openSheet({kind:"add", mode: tmdbKey() ? (el.dataset.mode||"search") : "manual"});
+    if (st.sheet.mode==="browse"){ browseHTML(st.sheet); browse(st.sheet); } else focusFirst();
+  },
   "close-sheet": () => closeSheet(),
-  "add-mode": el => { st.sheet.mode = el.dataset.mode; st.sheet.err = ""; renderSheet(); focusFirst(); },
+  "add-mode": el => {
+    const s = st.sheet; const m = el.dataset.mode; if (s.mode===m) return;
+    s.mode = m; s.err = ""; s.results = null; s.loading = false; s.reqId = (s.reqId||0) + 1;
+    if (m==="browse"){ browseHTML(s); browse(s); } else { renderSheet(); focusFirst(); }
+  },
+  "b-svc": el => { st.sheet.bsvc = el.dataset.v; browse(st.sheet); },
+  "b-type": el => { st.sheet.btype = el.dataset.v; st.sheet.bcat = ""; browse(st.sheet); },
+  "b-sort": el => { st.sheet.bsort = el.dataset.v; browse(st.sheet); },
+  "b-more": () => browse(st.sheet, true),
   "open": (el,id) => openSheet({kind:"detail", id}),
   "next": (el,id) => markNext(id),
   "start": (el,id) => { const L = listOf(id), it = clean(st.lists[L][id]); if (applyStatus(it,"watching")!=="watching"){ toast(notOutMsg(it)); return; } upsert(it, L); toast(`Started ${it.title}`); },
@@ -1102,7 +1179,7 @@ const A = {
   },
   "add-result": async el => {
     const s = st.sheet; const i = +el.dataset.idx; const r = s.results[i]; const k = el.dataset.status;
-    s.adding = i; renderSheet();
+    s.adding = i; (s.touched = s.touched || new Set()).add(r.type + ":" + r.tmdbId); renderSheet();
     try { const m = await details(r.type, r.tmdbId); if (k==="caughtup"){
         if (!isOut(m)){ const it = addFromMeta(m, "want"); toast(notOutMsg(it)); }
         else { const ex = findExisting(m); const it = clean(ex || makeItem(m, "watching", st.list)); if (catchUp(it)){ upsert(it, ex ? listOf(it.id) : st.list); caughtUpToast(it); } else { upsert(it, ex ? listOf(it.id) : st.list); toast(`${it.title} added to Watching`); } }
@@ -1281,6 +1358,8 @@ document.addEventListener("input", e => {
 });
 document.addEventListener("change", e => {
   const t = e.target;
+  if (t.id==="bCat" && st.sheet){ st.sheet.bcat = t.value; t.blur(); browse(st.sheet); return; }
+  if (t.id==="bHide" && st.sheet){ st.sheet.bhide = t.checked; renderSheet(); return; }
   if (t.id==="recent"){ st.profile.recent = t.checked; backend.saveProfile(); }
   else if (t.id==="onlyMine"){ st.profile.onlyMine = t.checked; backend.saveProfile(); }
   else if (t.id==="notes"){ const L = listOf(t.dataset.id), it = clean(st.lists[L][t.dataset.id]); if (it.notes !== t.value){ it.notes = t.value.slice(0,2000); upsert(it, L); } }
