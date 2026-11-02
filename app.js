@@ -53,7 +53,20 @@ function clean(o){ return JSON.parse(JSON.stringify(o)); }
 function pad(n){ return String(n).padStart(2,"0"); }
 function code(s,e){ return "S" + pad(s) + "E" + pad(e); }
 function hash(s){ let h = 7; for (const c of String(s)) h = (h*31 + c.charCodeAt(0)) | 0; return Math.abs(h); }
-function fmtDate(iso){ if (!iso) return ""; const d = new Date(iso + "T12:00:00"); return isNaN(d) ? "" : d.toLocaleDateString(undefined,{month:"short",day:"numeric"}); }
+function fmtDate(iso){
+  if (!iso) return ""; const d = new Date(iso + "T12:00:00"); if (isNaN(d)) return "";
+  const o = {month:"short", day:"numeric"}; if (d.getFullYear() !== new Date().getFullYear()) o.year = "numeric";
+  return d.toLocaleDateString(undefined, o);
+}
+function ymd(d){ return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}`; }
+function todayISO(){ return ymd(new Date()); }
+function dayDiff(iso){ const t = new Date(iso + "T12:00:00"), n = new Date(); n.setHours(12,0,0,0); return Math.round((t - n) / DAY); }
+function relDay(iso){
+  const k = dayDiff(iso);
+  if (k===0) return "today"; if (k===1) return "tomorrow"; if (k===-1) return "yesterday";
+  if (k>1 && k<7) return new Date(iso + "T12:00:00").toLocaleDateString(undefined,{weekday:"long"});
+  return fmtDate(iso);
+}
 function fmtRun(m){ if(!m) return ""; const h = Math.floor(m/60), r = m%60; return h ? `${h}h ${pad(r)}m` : `${m}m`; }
 async function pool(arr, n, fn){
   const out = new Array(arr.length); let i = 0;
@@ -218,11 +231,22 @@ function toMeta(type, d){
     overview: str(d.overview, 600), showStatus: st8,
     runtimeMin: tv ? ((d.episode_run_time||[])[0] || (d.last_episode_to_air||{}).runtime || null) : (d.runtime || null),
     seasons, poster: d.poster_path || "",
-    nextAir: nx ? {date:nx.air_date||"", s:nx.season_number, e:nx.episode_number} : null
+    nextAir: nx ? {date:nx.air_date||"", s:nx.season_number, e:nx.episode_number} : null,
+    lastAir: tv && d.last_episode_to_air ? {date:d.last_episode_to_air.air_date||"", s:d.last_episode_to_air.season_number, e:d.last_episode_to_air.episode_number} : null,
+    firstAir: tv ? (d.first_air_date||"") : "",
+    ...(tv ? {} : usDates(d)),
+    mv: 2
   };
 }
+function usDates(d){
+  // US release dates by type: 2/3 theatrical, 4 digital (includes streaming premieres).
+  const us = ((d.release_dates||{}).results||[]).find(r => r.iso_3166_1==="US");
+  const rows = ((us && us.release_dates)||[]).map(r => ({t:r.type, d:String(r.release_date||"").slice(0,10)})).filter(r => r.d);
+  const first = t => rows.filter(r => t.includes(r.t)).map(r => r.d).sort()[0] || "";
+  return {releaseDate: first([2,3]) || d.release_date || "", digitalDate: first([4])};
+}
 async function details(type, id, fresh){
-  const d = await tmdb(`/${type}/${id}`, {append_to_response:"watch/providers,credits"}, fresh);
+  const d = await tmdb(`/${type}/${id}`, {append_to_response: type==="movie" ? "watch/providers,credits,release_dates" : "watch/providers,credits"}, fresh);
   return toMeta(type, d);
 }
 async function searchTitles(q){
@@ -241,7 +265,8 @@ function makeItem(m, status, L){
     genres: genresOf({genres:m.genres||[], type}).slice(0,4), platforms: platsOf(m), providerLink:str(m.providerLink,300),
     network:str(m.network,120), people:str(m.people,200), overview:str(m.overview,600), showStatus:str(m.showStatus,20),
     runtimeMin:Math.round(+m.runtimeMin)||null, seasons: type==="tv" && Array.isArray(m.seasons) ? m.seasons.map(n=>Math.max(0,Math.round(+n||0))).slice(0,80) : [],
-    poster:str(m.poster,120), nextAir:m.nextAir||null,
+    poster:str(m.poster,120), nextAir:m.nextAir||null, lastAir:m.lastAir||null,
+    firstAir:str(m.firstAir,10), releaseDate:str(m.releaseDate,10), digitalDate:str(m.digitalDate,10), mv:m.mv||1,
     status:"want", rating:null, progress:{s:1,e:0}, notes:"",
     addedAt:Date.now(), updatedAt:Date.now(), finishedAt:null, checkedAt: m.tmdbId ? Date.now() : null,
     addedBy: L==="ours" ? uid() : null
@@ -277,6 +302,9 @@ function mergeMeta(it, m){
   ["tmdbId","title","year","network","people","overview","showStatus","runtimeMin","poster","providerLink"].forEach(k => { if (m[k] != null && m[k] !== "") out[k] = m[k]; });
   out.endYear = m.endYear || null;
   out.nextAir = m.nextAir || null;
+  out.lastAir = m.lastAir || null;
+  ["firstAir","releaseDate","digitalDate"].forEach(k => { out[k] = m[k] || ""; });
+  if (m.mv) out.mv = m.mv;
   if (!it.genresManual && m.genres && m.genres.length) out.genres = m.genres;
   if (!it.platformsManual) out.platforms = m.platforms || [];
   if (it.type==="tv" && m.seasons && m.seasons.length){
@@ -431,10 +459,11 @@ async function runRefresh(){
   ["mine","ours"].forEach(L => Object.values(st.lists[L]).forEach(x => {
     if (!x.tmdbId || refreshedThisVisit.has(x.id)) return;
     const active = x.type==="tv" && (x.status==="watching" || x.status==="want" || (x.status==="watched" && x.showStatus!=="ended"));
-    const stale = !x.checkedAt || Date.now() - x.checkedAt > (active ? 0.5 : 14) * DAY;
+    const stale = !x.checkedAt || x.mv !== 2 || Date.now() - x.checkedAt > (active ? 0.5 : 14) * DAY;
     if (stale) due.push([L, x.id]);
   }));
   if (!due.length) return;
+  due.sort((a,b) => (st.lists[a[0]][a[1]].mv===2) - (st.lists[b[0]][b[1]].mv===2));
   refreshing = true;
   try {
     await pool(due.slice(0,30), 3, async ([L,id]) => {
@@ -617,7 +646,8 @@ function renderMain(){
   const list = arr => `<div class="list">${arr.map(cardHTML).join("")}</div>`;
   const filt = "Nothing here matches those filters. Tap All or Anywhere to clear them.";
   if (st.tab==="watching"){
-    const arr = all.filter(x=>x.status==="watching").sort((a,b) => (b.newAt||0)-(a.newAt||0) || (b.updatedAt||0)-(a.updatedAt||0));
+    const fresh = x => { const s = schedule(x); return s && s.tone==="new" ? 1 : 0; };
+    const arr = all.filter(x=>x.status==="watching").sort((a,b) => fresh(b)-fresh(a) || (b.newAt||0)-(a.newAt||0) || (b.updatedAt||0)-(a.updatedAt||0));
     if (arr.length) html += list(arr);
     else if (none && st.list==="ours") html += emptyBlock("Our list is empty",
       "Everything here is shared with everyone who joined with your invite code: titles, progress, ratings and notes. Add a title, or open one on My list and move it here.",
@@ -658,6 +688,37 @@ function ratingChip(it){
   const r = RATINGS.find(q=>q[0]===it.rating);
   return r ? `<span class="chip r-${r[0]}">${r[1]}</span>` : rateRow(it);
 }
+function schedule(it){
+  const T = todayISO();
+  if (it.type==="tv"){
+    const nx = it.nextAir, la = it.lastAir;
+    if (it.showStatus==="upcoming" && (!it.firstAir || it.firstAir > T)){
+      const d = (nx && nx.date) || it.firstAir;
+      return d ? {tone:"soon", text:`Premieres ${relDay(d)}`} : {tone:"info", text:"Premiere date not announced"};
+    }
+    if (nx && nx.date){
+      if (nx.date <= T) return {tone:"new", text:`${code(nx.s,nx.e)} out ${relDay(nx.date)==="today" ? "today" : "now"}`};
+      if (nx.e===1) return {tone:"soon", text:`Season ${nx.s} premieres ${relDay(nx.date)}`};
+      return {tone:"soon", text:`Next: ${code(nx.s,nx.e)} · ${relDay(nx.date)}`};
+    }
+    if (la && la.date && dayDiff(la.date) >= -7 && dayDiff(la.date) <= 0) return {tone:"new", text:`${code(la.s,la.e)} aired ${relDay(la.date)}`};
+    if (it.showStatus==="returning" && it.status==="watching") return {tone:"info", text:"Next episode date not announced"};
+    if (it.showStatus==="ended" && it.status==="watching" && la && la.date) return {tone:"info", text:`Series ended ${fmtDate(la.date)}`};
+    return null;
+  }
+  const th = it.releaseDate, dg = it.digitalDate;
+  const streamFirst = dg && (!th || th >= dg);
+  if (th && th > T && !streamFirst) return {tone:"soon", text:`In theaters ${relDay(th)}`};
+  if (dg && dg > T) return {tone:"soon", text:`${streamFirst ? "Drops" : "On digital"} ${relDay(dg)}`};
+  const svc = platsOf(it).find(p => !["In theaters","Rent or buy","Cable / live TV"].includes(p));
+  if (dg && dayDiff(dg) >= -21) return {tone:"new", text: svc ? `New on ${svc} · ${relDay(dg)}` : `${streamFirst ? "Dropped" : "Out on digital"} ${relDay(dg)}`};
+  if (th && dayDiff(th) >= -60 && dayDiff(th) <= 0 && !platsOf(it).some(p => p!=="In theaters" && p!=="Rent or buy")) return {tone:"info", text:`In theaters since ${fmtDate(th)}`};
+  return null;
+}
+function schedHTML(it){
+  if (it.status==="dropped") return "";
+  const s = schedule(it); return s ? `<p class="sched ${s.tone}">${esc(s.text)}</p>` : "";
+}
 function cardHTML(it){
   let prog = "", acts = "";
   const isNew = it.newAt && Date.now() - it.newAt < 14*DAY && nextEp(it);
@@ -665,14 +726,12 @@ function cardHTML(it){
     const tot = totalEps(it), done = watchedEps(it), n = nextEp(it);
     prog = `<div class="prog"><div class="bar"><i style="width:${tot ? Math.min(100, done/tot*100).toFixed(1) : 0}%"></i></div><span class="mono">${done}${tot ? " / " + tot : ""} eps</span></div>`;
     acts = n ? `${isNew ? `<span class="chip new">New episodes</span>` : ""}<button class="btn primary" data-action="next" data-id="${it.id}">Watched <span class="mono">${code(n.s,n.e)}</span></button>`
-             : it.nextAir && it.nextAir.date ? `<span class="chip">Next episode ${esc(fmtDate(it.nextAir.date))}</span>`
              : `<span class="chip c-watched"><span class="dot"></span>Caught up</span>`;
     acts += `<button class="btn ghost" data-action="finish" data-id="${it.id}">Finished</button>`;
   } else if (it.status==="watching"){
     acts = `<button class="btn primary" data-action="finish" data-id="${it.id}">Finished it</button>`;
   } else if (it.status==="want"){
     acts = it.type==="tv" ? `<button class="btn" data-action="start" data-id="${it.id}">Start watching</button><button class="btn ghost" data-action="finish" data-id="${it.id}">Seen it</button>` : `<button class="btn" data-action="finish" data-id="${it.id}">Watched it</button>`;
-    if (it.showStatus==="upcoming" && it.nextAir && it.nextAir.date) acts += `<span class="chip">Premieres ${esc(fmtDate(it.nextAir.date))}</span>`;
   } else if (it.status==="watched"){
     acts = (isNew ? `<button class="btn ghost" data-action="start" data-id="${it.id}">New season · resume</button>` : "") + ratingChip(it);
   } else {
@@ -681,7 +740,7 @@ function cardHTML(it){
   const by = st.list==="ours" && it.addedBy && it.addedBy!==uid() && memberName(it.addedBy) ? `<p class="by">Added by ${esc(memberName(it.addedBy))}</p>` : "";
   return `<article class="card" data-action="open" data-id="${it.id}" tabindex="0" aria-label="${esc(it.title)}">
     ${poster(it)}
-    <div class="body"><h3>${esc(it.title)}</h3><p class="meta">${esc(metaLine(it))}</p>${svcBadges(it,3)}${by}${prog}<div class="acts">${acts}</div></div>
+    <div class="body"><h3>${esc(it.title)}</h3><p class="meta">${esc(metaLine(it))}</p>${schedHTML(it)}${svcBadges(it,3)}${by}${prog}<div class="acts">${acts}</div></div>
   </article>`;
 }
 
@@ -823,6 +882,9 @@ function detailHTML(it, s, L){
   if (it.runtimeMin) kv.push([it.type==="movie" ? "Runtime" : "Episode", fmtRun(it.runtimeMin)]);
   if (it.showStatus) kv.push(["Status", {returning:"Still airing",ended:"Ended",upcoming:"Coming soon",released:"Released"}[it.showStatus] || it.showStatus]);
   if (it.nextAir && it.nextAir.date) kv.push(["Next", `${code(it.nextAir.s,it.nextAir.e)} on ${fmtDate(it.nextAir.date)}`]);
+  if (it.lastAir && it.lastAir.date) kv.push(["Last aired", `${code(it.lastAir.s,it.lastAir.e)} on ${fmtDate(it.lastAir.date)}`]);
+  if (it.type==="movie" && it.releaseDate) kv.push(["In theaters", fmtDate(it.releaseDate)]);
+  if (it.type==="movie" && it.digitalDate) kv.push(["Streaming / digital", fmtDate(it.digitalDate)]);
   if (L==="ours" && it.addedBy && memberName(it.addedBy)) kv.push(["Added by", memberName(it.addedBy)]);
   const ps = platsOf(it), gs = genresOf(it);
   let h = `<div class="sheet-head"><span class="lbl" style="margin:0">${it.type==="movie"?"Movie":"TV show"} · ${LIST_NAME[L]}</span><button class="x" data-action="close-sheet" aria-label="Close">×</button></div>
