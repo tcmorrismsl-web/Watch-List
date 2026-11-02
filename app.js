@@ -452,9 +452,28 @@ function startCloud(u){
     if (hid !== (st.household ? st.household.id : null)) watchHousehold(hid);
     render();
   }, () => {}));
+  let imported = false;
   unsubs.push(fs.collection(`users/${u.uid}/items`).onSnapshot(snap => {
-    st.lists.mine = toMap(snap); st.ready = true; st.slow = false; clearTimeout(timer); render(); scheduleRefresh();
+    st.lists.mine = toMap(snap); st.ready = true; st.slow = false; clearTimeout(timer);
+    if (!imported && !snap.metadata.fromCache){ imported = true; importLocal(u.uid); }
+    render(); scheduleRefresh();
   }, () => { st.ready = true; st.slow = true; render(); }));
+}
+// Titles saved on this device before signing in move into the account once, skipping any already there.
+function importLocal(id){
+  let d = null; try { d = JSON.parse(lsGet("wl.data")||"null"); } catch(e){}
+  if (!d || lsGet("wl.imported." + id)) return;
+  const items = Object.values(d.items||{});
+  let n = 0;
+  items.forEach(x => {
+    if (!x || !x.id || findIn("mine", x)) return;
+    const it = clean(x); st.lists.mine[it.id] = it; backend.saveItem(it, "mine"); n++;
+  });
+  const p = d.profile || {};
+  const cloudEmpty = !st.profile.genres.length && !(st.profile.services||[]).length;
+  if (cloudEmpty && ((p.genres||[]).length || (p.services||[]).length)){ st.profile = {...DEF_PROFILE, ...p}; backend.saveProfile(); }
+  lsSet("wl.imported." + id, "1");
+  if (n) toast(`Moved ${n} title${n>1?"s":""} from this phone into your account`);
 }
 function watchHousehold(hid){
   hUnsubs.forEach(f=>f()); hUnsubs = []; st.lists.ours = {};
