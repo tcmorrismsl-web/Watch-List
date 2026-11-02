@@ -4,6 +4,12 @@ About 15 minutes, once. Everything here is free and needs no credit card.
 
 Your site: **https://tcmorrismsl-web.github.io/Watch-List/**
 
+## 0. Turn on the website
+
+1. On GitHub, open the repo and go to **Settings → Pages**.
+2. Under **Build and deployment**, set **Source** to **Deploy from a branch**, branch **main**, folder **/ (root)**, and click **Save**.
+3. Wait a minute or two, then open the site address above. It works right away, saving to that one browser, until you finish the steps below.
+
 ## 1. Get a TMDB key (posters, seasons, categories, where to stream)
 
 1. Create a free account at [themoviedb.org](https://www.themoviedb.org/signup).
