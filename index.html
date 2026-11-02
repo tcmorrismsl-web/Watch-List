@@ -857,7 +857,7 @@ function focusFirst(){ setTimeout(()=>{ const el = sheet.querySelector("#q,#bulk
 document.addEventListener("click", e => {
   const el = e.target.closest("[data-action]"); if (!el) return;
   const f = A[el.dataset.action]; if (!f) return;
-  if (el.tagName==="BUTTON" && el.type==="submit") return;
+  if (el.tagName==="BUTTON" && el.type==="submit" && el.form) return;
   e.stopPropagation(); f(el, el.dataset.id, e);
 });
 document.addEventListener("keydown", e => {
