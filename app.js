@@ -1,0 +1,1167 @@
+/* Watch List — runs on GitHub Pages.
+   Show data: TMDB (search, seasons, categories, US streaming providers, recommendations).
+   Sync + sharing: Firebase Auth + Firestore (optional; without it the list stays in this browser). */
+(() => {
+"use strict";
+
+/* ---------- constants ---------- */
+const CFG = window.WATCHLIST_CONFIG || {};
+const FB_CFG = CFG.firebase || {};
+const HAS_FB = !!(window.firebase && FB_CFG.apiKey && FB_CFG.projectId && FB_CFG.authDomain);
+const TMDB = "https://api.themoviedb.org/3";
+const IMG = "https://image.tmdb.org/t/p/";
+
+const GENRES = ["Drama","Comedy","Reality TV","Docuseries","Documentary","Crime","Thriller","Mystery","Sci-Fi","Fantasy","Action",
+  "Horror","Animation","Anime","Romance","Family","History","War","Western","Music","Talk show","News","Stand-up"];
+const TMDB_GENRE = {"Action & Adventure":["Action"],"Adventure":["Action"],"Science Fiction":["Sci-Fi"],"Sci-Fi & Fantasy":["Sci-Fi","Fantasy"],
+  "War & Politics":["War"],"Reality":["Reality TV"],"Kids":["Family"],"Talk":["Talk show"],"Soap":["Drama"],"TV Movie":[]};
+const PLATFORMS = [
+  ["Netflix","#E50914"],["HBO Max","#3B4BDB"],["Hulu","#1CE783"],["Disney+","#113CCF"],["Prime Video","#00A8E1"],
+  ["Apple TV","#9A9AA0"],["Peacock","#F2B807"],["Paramount+","#0064FF"],["Starz","#6E6E73"],["AMC+","#D7A20E"],
+  ["MGM+","#B8954A"],["Discovery+","#2175D9"],["Crunchyroll","#F47521"],["BritBox","#2B4C9B"],["Acorn TV","#3E7B3E"],
+  ["Shudder","#C8102E"],["BET+","#7E57C2"],["Tubi","#7A2CF5"],["Pluto TV","#E6D000"],["Roku Channel","#6C3C97"],["YouTube","#FF0033"],
+  ["Cable / live TV","#4F7A99"],["Rent or buy","#8A8F9C"],["In theaters","#B5651D"]
+];
+const PLAT_COLOR = Object.fromEntries(PLATFORMS);
+const SERVICE_CHOICES = PLATFORMS.slice(0, 21).map(p => p[0]);
+const PROV_RULES = [
+  [/^netflix/i,"Netflix"],[/^(hbo )?max\b|^hbo max|^hbo now/i,"HBO Max"],[/^hulu/i,"Hulu"],[/^disney/i,"Disney+"],
+  [/^(amazon )?prime video|^amazon freevee|^freevee/i,"Prime Video"],[/^apple tv/i,"Apple TV"],[/^peacock/i,"Peacock"],
+  [/^paramount|^showtime/i,"Paramount+"],[/^starz/i,"Starz"],[/^amc\s?(\+|plus)/i,"AMC+"],[/^mgm/i,"MGM+"],
+  [/^discovery\s?(\+|plus)/i,"Discovery+"],[/^crunchyroll/i,"Crunchyroll"],[/^britbox/i,"BritBox"],[/^acorn/i,"Acorn TV"],
+  [/^shudder/i,"Shudder"],[/^bet\s?(\+|plus)/i,"BET+"],[/^tubi/i,"Tubi"],[/^pluto/i,"Pluto TV"],[/^the roku channel|^roku channel/i,"Roku Channel"],
+  [/^youtube tv|^fubo|^sling|^directv|^philo|^spectrum|^xfinity|^frndly/i,"Cable / live TV"],[/^youtube( premium| free)?$/i,"YouTube"]
+];
+const TABS = [["watching","Watching"],["want","Up next"],["watched","Watched"],["foryou","For you"]];
+const RATINGS = [[2,"Loved"],[1,"Liked"],[0,"Meh"],[-1,"Not for me"]];
+const STATUS_LABEL = {want:"Up next",watching:"Watching",watched:"Watched",dropped:"Dropped"};
+const LIST_NAME = {mine:"My list", ours:"Our list"};
+const DEF_PROFILE = {genres:[],services:[],onlyMine:false,kind:"both",recent:false,dismissed:[]};
+const DAY = 864e5;
+
+/* ---------- small helpers ---------- */
+const $ = id => document.getElementById(id);
+const main = $("main"), sheet = $("sheet"), sheetWrap = $("sheetWrap");
+function lsGet(k){ try { return localStorage.getItem(k); } catch(e){ return null; } }
+function lsSet(k,v){ try { if (v == null) localStorage.removeItem(k); else localStorage.setItem(k,v); } catch(e){} }
+function esc(s){ return String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c])); }
+function str(v,n){ return v == null ? "" : String(v).slice(0,n); }
+function norm(s){ return String(s||"").toLowerCase().replace(/^the\s+/,"").replace(/[^a-z0-9]+/g,""); }
+function key(s){ return String(s||"").toLowerCase().replace(/[^a-z0-9]+/g,""); }
+function newId(){ return "t" + Date.now().toString(36) + Math.random().toString(36).slice(2,8); }
+function clean(o){ return JSON.parse(JSON.stringify(o)); }
+function pad(n){ return String(n).padStart(2,"0"); }
+function code(s,e){ return "S" + pad(s) + "E" + pad(e); }
+function hash(s){ let h = 7; for (const c of String(s)) h = (h*31 + c.charCodeAt(0)) | 0; return Math.abs(h); }
+function fmtDate(iso){ if (!iso) return ""; const d = new Date(iso + "T12:00:00"); return isNaN(d) ? "" : d.toLocaleDateString(undefined,{month:"short",day:"numeric"}); }
+function fmtRun(m){ if(!m) return ""; const h = Math.floor(m/60), r = m%60; return h ? `${h}h ${pad(r)}m` : `${m}m`; }
+async function pool(arr, n, fn){
+  const out = new Array(arr.length); let i = 0;
+  await Promise.all(Array.from({length:Math.min(n, arr.length)}, async () => { while (i < arr.length){ const j = i++; out[j] = await fn(arr[j], j); } }));
+  return out;
+}
+let toastTimer;
+function toast(msg){ const t = $("toast"); t.textContent = msg; t.hidden = false; clearTimeout(toastTimer); toastTimer = setTimeout(()=>{ t.hidden = true; }, 2800); }
+
+/* ---------- state ---------- */
+const st = {
+  mode:null,               // "cloud" | "local"
+  authReady:false,
+  user:null, authErr:"", authBusy:false,
+  ready:false,
+  lists:{mine:{}, ours:{}},
+  list: lsGet("wl.list")==="ours" ? "ours" : "mine",
+  household:null, hhErr:"", hhBusy:false,
+  userDoc:{}, profile:{...DEF_PROFILE},
+  tab: TABS.some(t => t[0]===lsGet("wl.tab")) ? lsGet("wl.tab") : "watching",
+  cat: lsGet("wl.cat") || "", plat: lsGet("wl.plat") || "", filter:"",
+  sheet:null,
+  picks:{mine:null, ours:null}, picksBusy:false, picksErr:"",
+  fresh:null, freshBusy:false, freshErr:"", freshFor:"",
+  fillBusy:false, updBusy:false
+};
+Object.defineProperty(st, "items", {get(){ return st.lists[st.list]; }});
+try { const p = JSON.parse(lsGet("wl.picks")||"null"); if (p) st.picks = {mine:p.mine||null, ours:p.ours||null}; } catch(e){}
+function tmdbKey(){ return (lsGet("wl.tmdb") || st.userDoc.tmdbKey || (st.household && st.household.tmdbKey) || CFG.tmdbKey || "").trim(); }
+function uid(){ return st.user && st.user.uid; }
+function listOf(id){ return st.lists.ours[id] ? "ours" : st.lists.mine[id] ? "mine" : st.list; }
+
+/* ---------- categories & services ---------- */
+function normGenre(g, type){
+  if (!g) return "";
+  const k = key(g);
+  let out = GENRES.find(x => key(x)===k) || ({reality:"Reality TV",realitytv:"Reality TV",scifi:"Sci-Fi",sciencefiction:"Sci-Fi",standup:"Stand-up",talk:"Talk show",kids:"Family"})[k] || String(g).trim().slice(0,30);
+  if (out==="Documentary" && type==="tv") out = "Docuseries";
+  if (out==="Docuseries" && type==="movie") out = "Documentary";
+  return out;
+}
+function mapTmdbGenres(names, type, lang){
+  const out = [];
+  names.forEach(n => (TMDB_GENRE[n] || [n]).forEach(g => out.push(normGenre(g, type))));
+  if (lang==="ja" && out.includes("Animation")) out.push("Anime");
+  return [...new Set(out.filter(Boolean))];
+}
+function genresOf(it){ return [...new Set((it.genres||[]).map(g => normGenre(g, it.type)).filter(Boolean))]; }
+function normProvider(name){
+  const n = String(name||"").trim();
+  for (const [re, out] of PROV_RULES) if (re.test(n)) return out;
+  return n.replace(/\s+(with ads|amazon channel|apple tv channel|roku premium channel|standard with ads|basic with ads)$/i,"").slice(0,40);
+}
+function platsOf(x){ return [...new Set((Array.isArray(x.platforms)?x.platforms:[]).filter(Boolean))]; }
+function svcBadges(x, max){
+  const ps = platsOf(x); if (!ps.length) return "";
+  const shown = max ? ps.slice(0,max) : ps;
+  return `<div class="svcs">${shown.map(p=>`<span class="svc" style="--c:${PLAT_COLOR[p]||"#8A8F9C"}"><i></i>${esc(p)}</span>`).join("")}${ps.length>shown.length?`<span class="svc more">+${ps.length-shown.length}</span>`:""}</div>`;
+}
+
+/* ---------- episodes ---------- */
+function totalEps(it){ return (it.seasons||[]).reduce((a,b)=>a+(+b||0),0); }
+function watchedEps(it){
+  const S = it.seasons||[], p = it.progress||{s:1,e:0};
+  let n = 0; for (let i=0;i<p.s-1 && i<S.length;i++) n += S[i];
+  return n + (p.e||0);
+}
+function nextEp(it){
+  const S = it.seasons||[]; const p = it.progress||{s:1,e:0};
+  if (!S.length) return {s:p.s||1, e:(p.e||0)+1};
+  if ((p.e||0) < (S[p.s-1]||0)) return {s:p.s, e:(p.e||0)+1};
+  if (p.s < S.length) return {s:p.s+1, e:1};
+  return null;
+}
+function seasonsLabel(it){ const n = (it.seasons||[]).length; return n ? `${n} season${n>1?"s":""}` : "Series"; }
+function years(it){
+  if (!it.year) return "";
+  if (it.type==="tv" && it.endYear && it.endYear!==it.year) return `${it.year}–${it.endYear}`;
+  if (it.type==="tv" && it.showStatus==="returning") return `${it.year}–`;
+  return String(it.year);
+}
+function metaLine(it){
+  return [years(it), it.type==="movie" ? (it.runtimeMin ? fmtRun(it.runtimeMin) : "Film") : seasonsLabel(it), genresOf(it).slice(0,2).join(" / ")].filter(Boolean).join(" · ");
+}
+function poster(it, size){
+  const h = hash(it.title||""), h1 = h % 360, h2 = (h1 + 30 + (h>>9) % 90) % 360;
+  const img = it.poster ? `<img src="${IMG}${size==="lg"?"w342":"w185"}${esc(it.poster)}" alt="" loading="lazy" onerror="this.remove()">` : "";
+  return `<div class="poster ${size||""}" style="--h1:${h1};--h2:${h2}" aria-hidden="true">${img}<i>${it.type==="movie"?"FILM":"TV"}</i><span>${esc(it.title)}</span></div>`;
+}
+
+/* ---------- TMDB ---------- */
+const cache = new Map();
+async function tmdb(path, params, fresh){
+  const k = tmdbKey(); if (!k) throw {code:"nokey"};
+  const u = new URL(TMDB + path);
+  Object.entries(params||{}).forEach(([a,b]) => { if (b != null && b !== "") u.searchParams.set(a, b); });
+  const headers = {accept:"application/json"};
+  if (k.length > 60) headers.Authorization = "Bearer " + k; else u.searchParams.set("api_key", k);
+  const ck = u.toString() + (headers.Authorization ? "#b" : "");
+  if (!fresh && cache.has(ck)) return cache.get(ck);
+  let r;
+  try { r = await fetch(u, {headers}); } catch(e){ throw {code:"offline"}; }
+  if (r.status===401) throw {code:"badkey"};
+  if (r.status===429) throw {code:"busy"};
+  if (!r.ok) throw {code:"http", status:r.status};
+  const d = await r.json(); cache.set(ck, d); return d;
+}
+function tmdbErr(e){
+  const c = e && e.code;
+  if (c==="nokey") return "Add your TMDB key in Settings to look up titles.";
+  if (c==="badkey") return "TMDB didn't accept that key. Check it in Settings.";
+  if (c==="offline") return "You're offline. Try again when you're connected.";
+  if (c==="busy") return "TMDB is busy. Wait a few seconds and try again.";
+  return "Couldn't reach TMDB. Try again.";
+}
+let genreIdx = null;
+async function genreNames(){
+  if (!genreIdx){
+    const [a,b] = await Promise.all([tmdb("/genre/tv/list"), tmdb("/genre/movie/list")]);
+    genreIdx = {tv:{}, movie:{}};
+    (a.genres||[]).forEach(g => genreIdx.tv[g.id] = g.name);
+    (b.genres||[]).forEach(g => genreIdx.movie[g.id] = g.name);
+  }
+  return genreIdx;
+}
+let provIdx = null;
+async function providerIds(names){
+  if (!provIdx){
+    const [a,b] = await Promise.all([tmdb("/watch/providers/tv",{watch_region:"US"}), tmdb("/watch/providers/movie",{watch_region:"US"})]);
+    provIdx = {};
+    [...(a.results||[]), ...(b.results||[])].forEach(p => { const n = normProvider(p.provider_name); (provIdx[n] = provIdx[n] || new Set()).add(p.provider_id); });
+  }
+  const ids = new Set(); names.forEach(n => (provIdx[n]||[]).forEach(i => ids.add(i)));
+  return [...ids];
+}
+function toMeta(type, d){
+  const tv = type==="tv";
+  const date = (tv ? d.first_air_date : d.release_date) || "";
+  const seasons = [];
+  if (tv){
+    (d.seasons||[]).filter(s => s.season_number > 0).sort((a,b) => a.season_number - b.season_number).forEach(s => { seasons[s.season_number-1] = s.episode_count || 0; });
+    for (let i=0;i<seasons.length;i++) if (seasons[i]==null) seasons[i] = 0;
+    while (seasons.length && !seasons[seasons.length-1]) seasons.pop();
+  }
+  const wp = ((d["watch/providers"]||{}).results||{}).US || {};
+  const order = [...(wp.flatrate||[]), ...(wp.free||[]), ...(wp.ads||[])].sort((a,b)=>(a.display_priority||99)-(b.display_priority||99));
+  let platforms = [...new Set(order.map(p => normProvider(p.provider_name)).filter(Boolean))];
+  if (!platforms.length && (wp.rent || wp.buy)) platforms = ["Rent or buy"];
+  if (!tv && !platforms.length && date && (Date.now() - new Date(date).getTime()) < 75*DAY && Date.now() > new Date(date).getTime()) platforms = ["In theaters"];
+  const st8 = tv ? ({"Returning Series":"returning","Ended":"ended","Canceled":"ended","In Production":"upcoming","Planned":"upcoming","Pilot":"upcoming"}[d.status] || "returning")
+                 : (d.status==="Released" ? "released" : "upcoming");
+  const cast = ((d.credits||{}).cast||[]).slice(0,2).map(c=>c.name);
+  const lead = tv ? (d.created_by||[]).slice(0,2).map(c=>c.name) : [((d.credits||{}).crew||[]).find(c=>c.job==="Director")].filter(Boolean).map(c=>c.name);
+  const nx = tv && d.next_episode_to_air;
+  return {
+    tmdbId:d.id, type, title: tv ? d.name : d.title, year: +date.slice(0,4) || null,
+    endYear: tv && st8==="ended" && d.last_air_date ? +d.last_air_date.slice(0,4) : null,
+    genres: mapTmdbGenres((d.genres||[]).map(g=>g.name), type, d.original_language),
+    platforms, providerLink: wp.link || "",
+    network: tv ? (d.networks||[]).map(n=>n.name).slice(0,2).join(", ") : ((d.production_companies||[])[0]||{}).name || "",
+    people: [...lead, ...cast].join(", "),
+    overview: str(d.overview, 600), showStatus: st8,
+    runtimeMin: tv ? ((d.episode_run_time||[])[0] || (d.last_episode_to_air||{}).runtime || null) : (d.runtime || null),
+    seasons, poster: d.poster_path || "",
+    nextAir: nx ? {date:nx.air_date||"", s:nx.season_number, e:nx.episode_number} : null
+  };
+}
+async function details(type, id, fresh){
+  const d = await tmdb(`/${type}/${id}`, {append_to_response:"watch/providers,credits"}, fresh);
+  return toMeta(type, d);
+}
+async function searchTitles(q){
+  const d = await tmdb("/search/multi", {query:q, include_adult:"false", language:"en-US"});
+  return (d.results||[]).filter(r => r.media_type==="tv" || r.media_type==="movie").slice(0,8).map(r => ({
+    tmdbId:r.id, type:r.media_type, title: r.media_type==="tv" ? r.name : r.title,
+    year: +((r.first_air_date||r.release_date||"").slice(0,4)) || null, poster:r.poster_path||"", overview:str(r.overview,400), popularity:r.popularity||0
+  }));
+}
+
+/* ---------- items ---------- */
+function makeItem(m, status, L){
+  const type = m.type==="movie" ? "movie" : "tv";
+  const it = {
+    id:newId(), tmdbId:m.tmdbId||null, title:str(m.title||"Untitled",200), type, year:+m.year||null, endYear:+m.endYear||null,
+    genres: genresOf({genres:m.genres||[], type}).slice(0,4), platforms: platsOf(m), providerLink:str(m.providerLink,300),
+    network:str(m.network,120), people:str(m.people,200), overview:str(m.overview,600), showStatus:str(m.showStatus,20),
+    runtimeMin:Math.round(+m.runtimeMin)||null, seasons: type==="tv" && Array.isArray(m.seasons) ? m.seasons.map(n=>Math.max(0,Math.round(+n||0))).slice(0,80) : [],
+    poster:str(m.poster,120), nextAir:m.nextAir||null,
+    status:"want", rating:null, progress:{s:1,e:0}, notes:"",
+    addedAt:Date.now(), updatedAt:Date.now(), finishedAt:null, checkedAt: m.tmdbId ? Date.now() : null,
+    addedBy: L==="ours" ? uid() : null
+  };
+  applyStatus(it, status); return it;
+}
+function applyStatus(it, status){
+  it.status = status;
+  if (status==="watched"){
+    it.finishedAt = Date.now();
+    if (it.type==="tv" && it.seasons.length) it.progress = {s:it.seasons.length, e:it.seasons[it.seasons.length-1]};
+  }
+  if (!it.progress) it.progress = {s:1,e:0};
+}
+function findIn(L, m){
+  const t = m.type==="movie" ? "movie" : "tv", n = norm(m.title);
+  return Object.values(st.lists[L]).find(x => x.type===t && ((m.tmdbId && x.tmdbId===m.tmdbId) || (!m.tmdbId || !x.tmdbId) && norm(x.title)===n));
+}
+function findExisting(m){ return findIn(st.list, m); }
+function inAnyList(type, tmdbId){
+  return [...Object.values(st.lists.mine), ...Object.values(st.lists.ours)].some(x => x.type===type && x.tmdbId===tmdbId);
+}
+function upsert(it, L){
+  L = L || listOf(it.id);
+  it.updatedAt = Date.now(); st.lists[L][it.id] = it; backend.saveItem(it, L); render(true);
+}
+function addFromMeta(m, status){
+  const ex = findExisting(m); if (ex) return ex;
+  const it = makeItem(m, status, st.list); upsert(it, st.list); return it;
+}
+function mergeMeta(it, m){
+  const out = {...it};
+  ["tmdbId","title","year","network","people","overview","showStatus","runtimeMin","poster","providerLink"].forEach(k => { if (m[k] != null && m[k] !== "") out[k] = m[k]; });
+  out.endYear = m.endYear || null;
+  out.nextAir = m.nextAir || null;
+  if (!it.genresManual && m.genres && m.genres.length) out.genres = m.genres;
+  if (!it.platformsManual) out.platforms = m.platforms || [];
+  if (it.type==="tv" && m.seasons && m.seasons.length){
+    const before = totalEps(it); out.seasons = m.seasons;
+    if (before > 0 && totalEps(out) > before) out.newAt = Date.now();
+  }
+  out.checkedAt = Date.now();
+  return out;
+}
+function markNext(id){
+  const L = listOf(id); const it = clean(st.lists[L][id]); const n = nextEp(it); if (!n) return;
+  it.progress = n; it.status = "watching"; let msg = `Watched ${code(n.s,n.e)}`;
+  const S = it.seasons;
+  if (S.length && n.e === S[n.s-1]){
+    if (n.s === S.length){
+      if (it.showStatus==="ended"){ it.status = "watched"; it.finishedAt = Date.now(); msg = `Finished ${it.title}. Rate it under Watched.`; }
+      else msg = it.nextAir && it.nextAir.date ? `Caught up. Next episode ${fmtDate(it.nextAir.date)}.` : `Caught up on ${it.title}`;
+      delete it.newAt;
+    } else msg = `Finished season ${n.s}`;
+  }
+  upsert(it, L); toast(msg);
+}
+
+/* ---------- storage backends ---------- */
+let backend = null, fs = null, auth = null;
+function onWriteErr(e){
+  const c = e && e.code;
+  toast(c==="permission-denied" ? "You don't have access to change that list." : "Couldn't save that change. It will retry when you're back online.");
+}
+function localBackend(){
+  let d = null; try { d = JSON.parse(lsGet("wl.data")||"null"); } catch(e){}
+  d = d || {};
+  st.list = "mine"; st.lists.mine = d.items || {}; st.profile = {...DEF_PROFILE, ...(d.profile||{})}; st.ready = true;
+  const persist = () => lsSet("wl.data", JSON.stringify({items:st.lists.mine, profile:st.profile}));
+  return {saveItem:persist, deleteItem:persist, saveProfile:persist, saveUser:()=>{}};
+}
+function cloudBackend(){
+  const col = L => L==="ours" ? fs.collection(`households/${st.household.id}/items`) : fs.collection(`users/${uid()}/items`);
+  return {
+    saveItem(it, L){ L = L || st.list; if (L==="ours" && !st.household) return; col(L).doc(it.id).set(clean(it)).catch(onWriteErr); },
+    deleteItem(id, L){ L = L || st.list; if (L==="ours" && !st.household) return; col(L).doc(id).delete().catch(onWriteErr); },
+    saveProfile(){ fs.doc(`users/${uid()}`).set({profile:clean(st.profile)}, {merge:true}).catch(onWriteErr); },
+    saveUser(data){ return fs.doc(`users/${uid()}`).set(data, {merge:true}); }
+  };
+}
+function toMap(snap){ const m = {}; snap.forEach(d => { m[d.id] = {...d.data(), id:d.id}; }); return m; }
+let unsubs = [], hUnsubs = [];
+function stopAll(){ unsubs.forEach(f=>f()); hUnsubs.forEach(f=>f()); unsubs = []; hUnsubs = []; }
+function startCloud(u){
+  stopAll();
+  st.user = {uid:u.uid, name: (u.displayName || (u.email||"").split("@")[0] || "Someone").split(" ")[0], email:u.email||""};
+  st.ready = false; st.lists = {mine:{}, ours:{}}; st.household = null;
+  backend = cloudBackend();
+  const timer = setTimeout(() => { if (!st.ready){ st.ready = true; st.slow = true; render(); } }, 10000);
+  unsubs.push(fs.doc(`users/${u.uid}`).onSnapshot(s => {
+    const d = s.data() || {}; st.userDoc = d; st.profile = {...DEF_PROFILE, ...(d.profile||{})};
+    const hid = d.household || null;
+    if (hid !== (st.household ? st.household.id : null)) watchHousehold(hid);
+    render();
+  }, () => {}));
+  unsubs.push(fs.collection(`users/${u.uid}/items`).onSnapshot(snap => {
+    st.lists.mine = toMap(snap); st.ready = true; st.slow = false; clearTimeout(timer); render(); scheduleRefresh();
+  }, () => { st.ready = true; st.slow = true; render(); }));
+}
+function watchHousehold(hid){
+  hUnsubs.forEach(f=>f()); hUnsubs = []; st.lists.ours = {};
+  if (!hid){ st.household = null; if (st.list==="ours") render(true); return; }
+  st.household = {id:hid, members:[], names:{}, tmdbKey:"", loading:true};
+  hUnsubs.push(fs.doc(`households/${hid}`).onSnapshot(s => {
+    if (!s.exists){ st.household = null; render(true); return; }
+    const d = s.data(); st.household = {id:hid, members:d.members||[], names:d.names||{}, tmdbKey:d.tmdbKey||"", loading:false};
+    render();
+  }, () => { st.household = null; render(true); }));
+  hUnsubs.push(fs.collection(`households/${hid}/items`).onSnapshot(snap => {
+    st.lists.ours = toMap(snap); render(); scheduleRefresh();
+  }, () => {}));
+}
+
+/* ---------- sharing ---------- */
+const CODE_CHARS = "ABCDEFGHJKMNPQRSTUVWXYZ23456789";
+function newCode(){ const a = new Uint32Array(10); crypto.getRandomValues(a); return Array.from(a, n => CODE_CHARS[n % CODE_CHARS.length]).join(""); }
+function fmtCode(c){ return c ? c.slice(0,5) + "-" + c.slice(5) : ""; }
+function normCode(c){ return String(c||"").toUpperCase().replace(/[^A-Z0-9]/g,""); }
+async function createHousehold(){
+  const hid = newCode();
+  await fs.doc(`households/${hid}`).set({members:[uid()], names:{[uid()]:st.user.name}, tmdbKey:tmdbKey(), createdAt:Date.now()});
+  await backend.saveUser({household:hid});
+}
+async function joinHousehold(raw){
+  const hid = normCode(raw);
+  if (hid.length !== 10) throw {code:"badcode"};
+  await fs.doc(`households/${hid}`).update({members:firebase.firestore.FieldValue.arrayUnion(uid()), [`names.${uid()}`]:st.user.name});
+  await backend.saveUser({household:hid});
+}
+async function leaveHousehold(){
+  const hid = st.household && st.household.id; if (!hid) return;
+  try { await fs.doc(`households/${hid}`).update({members:firebase.firestore.FieldValue.arrayRemove(uid()), [`names.${uid()}`]:firebase.firestore.FieldValue.delete()}); } catch(e){}
+  await backend.saveUser({household:null});
+}
+function hhErrCopy(e){
+  const c = e && e.code;
+  if (c==="badcode") return "Invite codes are 10 letters and numbers, like ABCDE-FGH23.";
+  if (c==="not-found" || c==="permission-denied") return "No shared list matches that code. Check it and try again.";
+  if (c==="unavailable") return "You're offline. Try again when you're connected.";
+  return "That didn't work. Try again.";
+}
+function memberName(id){
+  if (!id) return "";
+  if (id===uid()) return "you";
+  return (st.household && st.household.names && st.household.names[id]) || "";
+}
+
+/* ---------- auth ---------- */
+function authCopy(e){
+  const c = e && e.code;
+  if (["auth/wrong-password","auth/invalid-credential","auth/invalid-login-credentials","auth/user-not-found"].includes(c)) return "That email and password don't match. Try again or create an account.";
+  if (c==="auth/email-already-in-use") return "There's already an account with that email. Sign in instead.";
+  if (c==="auth/weak-password") return "Use a password of at least 6 characters.";
+  if (c==="auth/invalid-email") return "That email address doesn't look right.";
+  if (c==="auth/unauthorized-domain") return `Firebase hasn't approved this site yet. Add ${location.hostname} under Authentication, Settings, Authorized domains.`;
+  if (c==="auth/operation-not-allowed") return "Turn on this sign-in method in Firebase under Authentication, Sign-in method.";
+  if (c==="auth/popup-closed-by-user" || c==="auth/cancelled-popup-request") return "";
+  if (c==="auth/network-request-failed") return "You're offline. Try again when you're connected.";
+  return "Sign-in didn't work. Try again.";
+}
+async function googleSignIn(){
+  const p = new firebase.auth.GoogleAuthProvider();
+  st.authErr = ""; st.authBusy = true; render(true);
+  try { await auth.signInWithPopup(p); }
+  catch(e){
+    if (["auth/popup-blocked","auth/operation-not-supported-in-this-environment"].includes(e.code)){ try { await auth.signInWithRedirect(p); return; } catch(e2){ e = e2; } }
+    st.authErr = authCopy(e);
+  }
+  st.authBusy = false; render(true);
+}
+async function emailAuth(create){
+  const email = ($("authEmail")||{}).value || "", pw = ($("authPw")||{}).value || "";
+  if (!email.trim() || !pw){ st.authErr = "Enter your email and a password."; render(true); return; }
+  st.authErr = ""; st.authBusy = true; render(true);
+  try { if (create) await auth.createUserWithEmailAndPassword(email.trim(), pw); else await auth.signInWithEmailAndPassword(email.trim(), pw); }
+  catch(e){ st.authErr = authCopy(e); }
+  st.authBusy = false; render(true);
+}
+
+/* ---------- background refresh of shows ---------- */
+let refreshTimer = null, refreshing = false; const refreshedThisVisit = new Set();
+function scheduleRefresh(){ clearTimeout(refreshTimer); refreshTimer = setTimeout(runRefresh, 2500); }
+async function runRefresh(){
+  if (refreshing || !tmdbKey()) return;
+  const due = [];
+  ["mine","ours"].forEach(L => Object.values(st.lists[L]).forEach(x => {
+    if (!x.tmdbId || refreshedThisVisit.has(x.id)) return;
+    const active = x.type==="tv" && (x.status==="watching" || x.status==="want" || (x.status==="watched" && x.showStatus!=="ended"));
+    const stale = !x.checkedAt || Date.now() - x.checkedAt > (active ? 0.5 : 14) * DAY;
+    if (stale) due.push([L, x.id]);
+  }));
+  if (!due.length) return;
+  refreshing = true;
+  try {
+    await pool(due.slice(0,30), 3, async ([L,id]) => {
+      refreshedThisVisit.add(id);
+      const cur = st.lists[L][id]; if (!cur) return;
+      try {
+        const m = await details(cur.type, cur.tmdbId, true);
+        const now = st.lists[L][id]; if (!now) return;
+        const merged = mergeMeta(now, m); merged.updatedAt = now.updatedAt;
+        st.lists[L][id] = merged; backend.saveItem(merged, L);
+      } catch(e){ if (e.code==="badkey" || e.code==="nokey") throw e; }
+    });
+  } catch(e){}
+  refreshing = false; render();
+}
+
+/* ---------- picks ---------- */
+function weight(x){
+  if (x.rating===2) return 3; if (x.rating===1) return 2; if (x.rating===0) return 0.3; if (x.rating===-1 || x.status==="dropped") return 0;
+  if (x.status==="watching") return 1.6; if (x.status==="watched") return 1; return 0.6;
+}
+function verb(x){ return x.rating===2 ? "loved" : x.rating===1 ? "liked" : x.status==="watching" ? "are watching" : x.status==="want" ? "saved" : "watched"; }
+async function buildPicks(){
+  const p = st.profile, nowY = new Date().getFullYear();
+  const dis = new Set(p.dismissed||[]);
+  const seeds = Object.values(st.items).filter(x => x.tmdbId && weight(x) > 0.5)
+    .sort((a,b) => weight(b)-weight(a) || (b.updatedAt||0)-(a.updatedAt||0)).slice(0,10);
+  const G = await genreNames();
+  const cands = new Map();
+  const add = (r, type, score, because) => {
+    if (!r || !r.id) return;
+    const t = r.media_type==="tv" || r.media_type==="movie" ? r.media_type : type;
+    if (t!=="tv" && t!=="movie") return;
+    const k = t + ":" + r.id;
+    if (inAnyList(t, r.id) || dis.has(k)) return;
+    if (p.kind!=="both" && p.kind!==t) return;
+    let c = cands.get(k); if (!c){ c = {k, type:t, r, score:0, because:[]}; cands.set(k, c); }
+    c.score += score; if (because && !c.because.includes(because)) c.because.push(because);
+  };
+  if (seeds.length){
+    const res = await pool(seeds, 4, async s => { try { return [s, await tmdb(`/${s.type}/${s.tmdbId}/recommendations`)]; } catch(e){ if (e.code==="badkey") throw e; return [s, null]; } });
+    res.forEach(([s,d]) => ((d && d.results) || []).slice(0,20).forEach((r,i) => add(r, s.type, weight(s) * (1 - i/30), s)));
+  }
+  if (cands.size < 14){
+    const t = await tmdb("/trending/all/week");
+    (t.results||[]).forEach((r,i) => add(r, r.media_type, 0.5 * (1 - i/40), null));
+  }
+  for (const c of cands.values()){
+    const names = mapTmdbGenres((c.r.genre_ids||[]).map(id => G[c.type][id]).filter(Boolean), c.type, c.r.original_language);
+    c.score += names.filter(g => p.genres.includes(g)).length * 0.6;
+    const y = +((c.r.first_air_date||c.r.release_date||"").slice(0,4)) || 0;
+    if (p.recent && y && y < nowY - 2) c.score *= 0.35;
+    c.score += Math.min((c.r.vote_average||0)/10, 1) * 0.4;
+    if ((c.r.vote_count||0) < 30) c.score *= 0.6;
+  }
+  const top = [...cands.values()].sort((a,b) => b.score-a.score).slice(0,24);
+  await pool(top, 5, async c => { try { c.meta = await details(c.type, c.r.id); } catch(e){} });
+  let out = top.filter(c => c.meta);
+  const svc = p.services || [];
+  if (svc.length){
+    out.forEach(c => { if (c.meta.platforms.some(x => svc.includes(x))) c.score += 1; });
+    if (p.onlyMine) out = out.filter(c => c.meta.platforms.some(x => svc.includes(x)));
+    out.sort((a,b) => b.score-a.score);
+  }
+  return out.slice(0,12).map(c => {
+    const b = c.because.slice(0,2);
+    const why = b.length ? `Because you ${verb(b[0])} ${b[0].title}${b[1] ? ` and ${b[1].title}` : ""}` : "Popular this week";
+    return {...c.meta, why};
+  });
+}
+async function buildFresh(){
+  const p = st.profile;
+  const svc = (p.services||[]).filter(s => !["Cable / live TV","Rent or buy","In theaters"].includes(s));
+  const ids = await providerIds(svc); if (!ids.length) return [];
+  const since = new Date(Date.now() - 150*DAY).toISOString().slice(0,10);
+  const kinds = p.kind==="both" ? ["tv","movie"] : [p.kind];
+  const lists = await Promise.all(kinds.map(t => tmdb(`/discover/${t}`, {
+    watch_region:"US", with_watch_providers:ids.join("|"), with_watch_monetization_types:"flatrate|free|ads",
+    sort_by:"popularity.desc", [t==="tv" ? "first_air_date.gte" : "primary_release_date.gte"]:since, "vote_count.gte": t==="movie" ? 15 : 3, language:"en-US"
+  }).then(d => (d.results||[]).map(r => ({...r, media_type:t})))));
+  const merged = []; for (let i=0;i<20;i++) lists.forEach(l => { if (l[i]) merged.push(l[i]); });
+  const dis = new Set(p.dismissed||[]);
+  const pick = merged.filter(r => !inAnyList(r.media_type, r.id) && !dis.has(r.media_type + ":" + r.id)).slice(0,10);
+  const metas = await pool(pick, 5, async r => { try { return await details(r.media_type, r.id); } catch(e){ return null; } });
+  return metas.filter(Boolean);
+}
+function savePicksLocal(){ lsSet("wl.picks", JSON.stringify(st.picks)); }
+
+/* ---------- rendering ---------- */
+let pendingMain = false, pendingSheet = false;
+function typingIn(root){ const a = document.activeElement; return !!a && root.contains(a) && /^(INPUT|TEXTAREA|SELECT)$/.test(a.tagName); }
+function render(force){
+  renderHeader();
+  if (!force && typingIn(main)) pendingMain = true; else { pendingMain = false; renderMain(); }
+  if (st.sheet){ if (!force && typingIn(sheet)) pendingSheet = true; else { pendingSheet = false; renderSheet(); } }
+}
+document.addEventListener("focusout", () => setTimeout(() => {
+  if (pendingMain && !typingIn(main)){ pendingMain = false; renderMain(); }
+  if (pendingSheet && st.sheet && !typingIn(sheet)){ pendingSheet = false; renderSheet(); }
+}, 0));
+
+function signedIn(){ return st.mode==="local" || (st.mode==="cloud" && !!st.user); }
+function oursBlocked(){ return st.list==="ours" && (!st.household || st.household.loading); }
+function counts(L){
+  const c = {want:0,watching:0,watched:0,dropped:0}; let min = 0;
+  for (const it of Object.values(st.lists[L||st.list])){
+    c[it.status] = (c[it.status]||0) + 1;
+    if (it.type==="movie" && it.status==="watched") min += it.runtimeMin||0;
+    if (it.type==="tv") min += watchedEps(it) * (it.runtimeMin||0);
+  }
+  return {c, hrs:Math.round(min/60)};
+}
+function renderHeader(){
+  const ok = signedIn();
+  const total = Object.keys(st.items).length;
+  const {c, hrs} = counts();
+  $("gear").hidden = !st.mode;
+  $("stats").textContent = !ok || !st.ready ? "" : total ? `${total} titles · ${hrs.toLocaleString()} hrs watched` : "No titles yet";
+  const sw = $("listsw");
+  sw.hidden = !(st.mode==="cloud" && st.user);
+  if (!sw.hidden) sw.innerHTML = ["mine","ours"].map(L => {
+    const n = L==="ours" && !st.household ? "" : Object.keys(st.lists[L]).length;
+    return `<button data-action="list" data-l="${L}" aria-pressed="${st.list===L}">${LIST_NAME[L]}${n!=="" ? `<span class="n">${n}</span>` : ""}</button>`;
+  }).join("");
+  $("tabs").hidden = !ok;
+  const n = {watching:c.watching, want:c.want, watched:c.watched + c.dropped};
+  $("tabs").innerHTML = TABS.map(([k,l]) => `<button class="tab" role="tab" data-action="tab" data-tab="${k}" aria-selected="${st.tab===k}">${l}${n[k]!=null && st.ready && !oursBlocked() ? `<span class="n">${n[k]}</span>` : ""}</button>`).join("");
+  $("fab").hidden = !ok || !st.ready || oursBlocked();
+  $("filterbar").hidden = !ok || st.tab==="foryou" || !total || oursBlocked();
+  $("filter").hidden = total < 8;
+  renderFacets();
+}
+function inTab(x){ return st.tab==="watched" ? (x.status==="watched" || x.status==="dropped") : x.status===st.tab; }
+function renderFacets(){
+  if ($("filterbar").hidden){ $("facets").innerHTML = ""; return; }
+  const tabItems = Object.values(st.items).filter(inTab);
+  const byPlat = st.plat ? tabItems.filter(x => st.plat==="__none" ? !platsOf(x).length : platsOf(x).includes(st.plat)) : tabItems;
+  const byCat = st.cat ? tabItems.filter(x => genresOf(x).includes(st.cat)) : tabItems;
+  // Each row's counts respect the other row's choice, so a number always matches what a tap shows.
+  const cc = {}; byPlat.forEach(x => genresOf(x).forEach(g => cc[g] = (cc[g]||0) + 1));
+  const pc = {}; let none = 0; byCat.forEach(x => { const ps = platsOf(x); if (!ps.length) none++; ps.forEach(p => pc[p] = (pc[p]||0) + 1); });
+  const cats = Object.keys(cc).sort((a,b) => (cc[b]-cc[a]) || a.localeCompare(b));
+  if (st.cat && !cats.includes(st.cat)) cats.unshift(st.cat);
+  const plats = Object.keys(pc).sort((a,b) => (pc[b]-pc[a]) || a.localeCompare(b));
+  if (st.plat && st.plat!=="__none" && !plats.includes(st.plat)) plats.unshift(st.plat);
+  const chip = (act, v, label, n) => `<button class="chipbtn" data-action="${act}" data-v="${esc(v)}" aria-pressed="${(act==="cat" ? st.cat : st.plat)===v}">${v && act==="plat" && v!=="__none" ? `<i class="sw" style="--c:${PLAT_COLOR[v]||"#8A8F9C"}"></i>` : ""}${esc(label)}${n!=null ? `<span class="n">${n}</span>` : ""}</button>`;
+  let h = "";
+  if (cats.length) h += `<div class="facet" role="group" aria-label="Category"><span class="lbl">Type</span><div class="scroller">${chip("cat","","All",byPlat.length)}${cats.map(c=>chip("cat",c,c,cc[c]||0)).join("")}</div></div>`;
+  if (plats.length || none || st.plat) h += `<div class="facet" role="group" aria-label="Where to watch"><span class="lbl">Where</span><div class="scroller">${chip("plat","","Anywhere",byCat.length)}${plats.map(p=>chip("plat",p,p,pc[p]||0)).join("")}${none || st.plat==="__none" ? chip("plat","__none","Not listed",none) : ""}</div></div>`;
+  $("facets").innerHTML = h;
+}
+function emptyBlock(title, text, buttons){
+  return `<div class="empty"><h2>${title}</h2><p class="lede">${text}</p>${buttons ? `<div class="row">${buttons}</div>` : ""}</div>`;
+}
+function loading(t){ return `<div class="thinking"><span class="pulse"></span>${t}</div>`; }
+
+function renderMain(){
+  if (!st.mode) { main.innerHTML = loading("Opening your list…"); return; }
+  if (st.mode==="cloud" && !st.authReady){ main.innerHTML = loading("Signing in…"); return; }
+  if (st.mode==="cloud" && !st.user){ main.innerHTML = signInHTML(); return; }
+  if (!st.ready){ main.innerHTML = loading("Opening your list…"); return; }
+  if (st.list==="ours" && !st.household){ main.innerHTML = shareSetupHTML(true); return; }
+  if (st.list==="ours" && st.household.loading){ main.innerHTML = loading("Opening Our list…"); return; }
+  if (st.tab==="foryou"){ main.innerHTML = forYouHTML() + footHTML(); return; }
+  const f = norm(st.filter);
+  let all = Object.values(st.items);
+  if (f) all = all.filter(x => norm(x.title).includes(f));
+  if (st.cat) all = all.filter(x => genresOf(x).includes(st.cat));
+  if (st.plat) all = all.filter(x => st.plat==="__none" ? !platsOf(x).length : platsOf(x).includes(st.plat));
+  const filtered = !!(f || st.cat || st.plat);
+  const none = !Object.keys(st.items).length;
+  let html = "";
+  if (st.slow && none) html += `<p class="note">Your list can't be reached yet. It will appear when the connection comes back.</p>`;
+  if (!tmdbKey()) html += `<div class="row banner"><p class="note">Add a free TMDB key to search titles and see posters, seasons and where to stream.</p><button class="btn" data-action="settings">Open Settings</button></div>`;
+  else {
+    const missing = Object.values(st.items).filter(x => !x.tmdbId && !x.lookedUp).length;
+    if (missing) html += `<div class="row banner"><p class="note">${missing} title${missing>1?"s aren't":" isn't"} matched to TMDB yet, so ${missing>1?"they don't":"it doesn't"} show posters or where to watch.</p>
+      <button class="btn" data-action="match-all" ${st.fillBusy?"disabled":""}>${st.fillBusy ? "Matching…" : "Match them"}</button></div>`;
+  }
+  const list = arr => `<div class="list">${arr.map(cardHTML).join("")}</div>`;
+  const filt = "Nothing here matches those filters. Tap All or Anywhere to clear them.";
+  if (st.tab==="watching"){
+    const arr = all.filter(x=>x.status==="watching").sort((a,b) => (b.newAt||0)-(a.newAt||0) || (b.updatedAt||0)-(a.updatedAt||0));
+    if (arr.length) html += list(arr);
+    else if (none && st.list==="ours") html += emptyBlock("Our list is empty",
+      "Everything here is shared with everyone who joined with your invite code: titles, progress, ratings and notes. Add a title, or open one on My list and move it here.",
+      `<button class="btn primary" data-action="open-add">Add a title</button>`);
+    else if (none) html += emptyBlock("Start with what you've seen",
+      "Paste a list of shows and movies you've already watched and Watch List fills in posters, seasons, categories and where each one streams. The more you log and rate, the better the picks under For you.",
+      `<button class="btn primary" data-action="open-add" data-mode="bulk">Paste a list</button><button class="btn" data-action="open-add" data-mode="search">Search a title</button>`);
+    else html += emptyBlock("Nothing in progress", filtered ? filt : "Start something from Up next, or add a show you're partway through.",
+      `<button class="btn" data-action="tab" data-tab="want">See Up next</button><button class="btn" data-action="open-add">Add a title</button>`);
+  } else if (st.tab==="want"){
+    const arr = all.filter(x=>x.status==="want").sort((a,b)=>(b.addedAt||0)-(a.addedAt||0));
+    html += arr.length ? list(arr) : emptyBlock("Your queue is empty", filtered ? filt : "Add things you mean to get to, or let For you suggest a few.",
+      `<button class="btn" data-action="tab" data-tab="foryou">Get picks</button><button class="btn" data-action="open-add">Add a title</button>`);
+  } else {
+    const arr = all.filter(x=>x.status==="watched").sort((a,b)=>(b.finishedAt||b.updatedAt||0)-(a.finishedAt||a.updatedAt||0));
+    const dr = all.filter(x=>x.status==="dropped").sort((a,b)=>(b.updatedAt||0)-(a.updatedAt||0));
+    const unrated = arr.filter(x=>x.rating==null).length;
+    if (arr.length){
+      if (unrated) html += `<p class="note">${unrated} unrated. Ratings are what For you learns from most.</p>`;
+      html += list(arr);
+    } else html += emptyBlock("Nothing logged yet", filtered ? filt : "Log what you've already seen, a whole list at a time.",
+      filtered ? "" : `<button class="btn primary" data-action="open-add" data-mode="bulk">Paste a list</button>`);
+    if (dr.length) html += `<section><p class="sub">Dropped</p>${list(dr)}</section>`;
+  }
+  main.innerHTML = html + footHTML();
+}
+function footHTML(){
+  const bits = [];
+  if (st.mode==="local") bits.push(HAS_FB ? "Saved in this browser only. Sign in under Settings to sync and share." : "Saved in this browser only. Set up sync (see SETUP.md in the repo) to use it on every device and share a list.");
+  if (st.list==="ours") bits.push("Our list is shared. Progress, ratings and notes here are the same for everyone on it.");
+  bits.push("Show data from TMDB. Streaming availability from JustWatch, for the US.");
+  return `<footer class="foot">${bits.map(b=>`<p class="note">${b}</p>`).join("")}</footer>`;
+}
+function ratingChip(it){
+  const r = RATINGS.find(q=>q[0]===it.rating);
+  return r ? `<span class="chip r-${r[0]}">${r[1]}</span>` : `<button class="btn ghost" data-action="open" data-id="${it.id}">Rate it</button>`;
+}
+function cardHTML(it){
+  let prog = "", acts = "";
+  const isNew = it.newAt && Date.now() - it.newAt < 14*DAY && nextEp(it);
+  if (it.type==="tv" && it.status==="watching"){
+    const tot = totalEps(it), done = watchedEps(it), n = nextEp(it);
+    prog = `<div class="prog"><div class="bar"><i style="width:${tot ? Math.min(100, done/tot*100).toFixed(1) : 0}%"></i></div><span class="mono">${done}${tot ? " / " + tot : ""} eps</span></div>`;
+    acts = n ? `${isNew ? `<span class="chip new">New episodes</span>` : ""}<button class="btn primary" data-action="next" data-id="${it.id}">Watched <span class="mono">${code(n.s,n.e)}</span></button>`
+             : it.nextAir && it.nextAir.date ? `<span class="chip">Next episode ${esc(fmtDate(it.nextAir.date))}</span>`
+             : `<span class="chip c-watched"><span class="dot"></span>Caught up</span>`;
+  } else if (it.status==="watching"){
+    acts = `<button class="btn primary" data-action="finish" data-id="${it.id}">Finished it</button>`;
+  } else if (it.status==="want"){
+    acts = it.type==="tv" ? `<button class="btn" data-action="start" data-id="${it.id}">Start watching</button>` : `<button class="btn" data-action="finish" data-id="${it.id}">Watched it</button>`;
+    if (it.showStatus==="upcoming" && it.nextAir && it.nextAir.date) acts += `<span class="chip">Premieres ${esc(fmtDate(it.nextAir.date))}</span>`;
+  } else if (it.status==="watched"){
+    acts = (isNew ? `<button class="btn ghost" data-action="start" data-id="${it.id}">New season · resume</button>` : "") + ratingChip(it);
+  } else {
+    acts = `<span class="chip c-dropped">Dropped${it.type==="tv" && watchedEps(it) ? ` at ${code(it.progress.s,it.progress.e)}` : ""}</span>`;
+  }
+  const by = st.list==="ours" && it.addedBy && it.addedBy!==uid() && memberName(it.addedBy) ? `<p class="by">Added by ${esc(memberName(it.addedBy))}</p>` : "";
+  return `<article class="card" data-action="open" data-id="${it.id}" tabindex="0" aria-label="${esc(it.title)}">
+    ${poster(it)}
+    <div class="body"><h3>${esc(it.title)}</h3><p class="meta">${esc(metaLine(it))}</p>${svcBadges(it,3)}${by}${prog}<div class="acts">${acts}</div></div>
+  </article>`;
+}
+
+function recCard(r, i, src){
+  const ex = findExisting(r);
+  return `<div class="res">${poster(r)}<div class="body">
+    <h3>${esc(r.title)}</h3><p class="meta">${esc(metaLine(r))}</p>
+    ${svcBadges(r)}
+    ${r.overview ? `<p class="overview clamp">${esc(r.overview)}</p>` : ""}
+    ${r.why ? `<p class="why"><b>Why</b>${esc(r.why)}</p>` : ""}
+    <div class="acts">${ex ? `<button class="btn ghost" data-action="open" data-id="${ex.id}">On ${LIST_NAME[st.list]} · ${STATUS_LABEL[ex.status]}</button>`
+      : `<button class="btn primary" data-action="rec-add" data-src="${src}" data-idx="${i}" data-status="want">Add to Up next</button>
+         <button class="btn" data-action="rec-add" data-src="${src}" data-idx="${i}" data-status="watched">Seen it</button>
+         <button class="btn ghost" data-action="rec-dismiss" data-src="${src}" data-idx="${i}">Not for me</button>`}</div>
+  </div></div>`;
+}
+function forYouHTML(){
+  const p = st.profile;
+  const kinds = [["both","Both"],["tv","Shows"],["movie","Movies"]];
+  let html = `<section class="panel" aria-labelledby="tasteH">
+    <div><h2 id="tasteH">Your taste</h2><p class="lede">Picks start from what you loved, liked and are watching${st.list==="ours" ? " on Our list" : ""}, then lean toward these.</p></div>
+    <div><span class="lbl">Services you have</span><div class="chips">${SERVICE_CHOICES.map(s=>`<button class="chipbtn" data-action="service" data-s="${esc(s)}" aria-pressed="${p.services.includes(s)}"><i class="sw" style="--c:${PLAT_COLOR[s]}"></i>${esc(s)}</button>`).join("")}</div>
+      ${p.services.length ? `<label class="check" for="onlyMine" style="margin-top:10px"><input type="checkbox" id="onlyMine" ${p.onlyMine?"checked":""}>Only pick things on my services</label>` : ""}</div>
+    <div><span class="lbl">Genres you reach for</span><div class="chips">${GENRES.map(g=>`<button class="chipbtn" data-action="genre" data-g="${esc(g)}" aria-pressed="${p.genres.includes(g)}">${esc(g)}</button>`).join("")}</div></div>
+    <div class="row"><div class="seg" role="group" aria-label="Show me">${kinds.map(([k,l])=>`<button class="chipbtn" data-action="kind" data-k="${k}" aria-pressed="${p.kind===k}">${l}</button>`).join("")}</div>
+    <label class="check" for="recent"><input type="checkbox" id="recent" ${p.recent?"checked":""}>Favor recent releases</label></div>
+  </section>`;
+  if (!tmdbKey()){
+    return html + `<section class="panel"><h2>Picks for you</h2><p class="lede">Picks need a TMDB key. Add one in Settings.</p><div><button class="btn primary" data-action="settings">Open Settings</button></div></section>`;
+  }
+  const pk = st.picks[st.list];
+  html += `<section class="panel" aria-labelledby="picksH"><div class="row" style="justify-content:space-between"><h2 id="picksH">Picks for you</h2>
+    <button class="btn ${pk ? "" : "primary"}" data-action="picks" ${st.picksBusy?"disabled":""}>${st.picksBusy ? "Finding…" : pk ? "Refresh picks" : "Get picks"}</button></div>`;
+  if (st.picksErr) html += `<p class="err">${esc(st.picksErr)}</p>`;
+  if (st.picksBusy) html += loading("Looking at what you've watched…");
+  else if (pk && pk.items && pk.items.length){
+    html += `<p class="sub">${pk.items.length} picks · ${new Date(pk.at).toLocaleDateString(undefined,{month:"short",day:"numeric"})}</p><div>${pk.items.map((r,i)=>recCard(r,i,"picks")).join("")}</div>`;
+  } else if (pk) html += `<p class="note">No picks matched. Try turning off "Only pick things on my services".</p>`;
+  else html += `<p class="note">${Object.keys(st.items).length ? "Rate a few things under Watched first for sharper picks." : "Add and rate a few titles first, or tap Get picks to start from what's popular."}</p>`;
+  html += `</section>`;
+  html += `<section class="panel" aria-labelledby="freshH"><div class="row" style="justify-content:space-between"><h2 id="freshH">New on your services</h2>
+    ${p.services.length ? `<button class="btn" data-action="fresh" ${st.freshBusy?"disabled":""}>${st.freshBusy ? "Loading…" : st.fresh ? "Refresh" : "Show me"}</button>` : ""}</div>`;
+  if (!p.services.length) html += `<p class="note">Pick the services you have above to see what's new on them from the last five months.</p>`;
+  else {
+    if (st.freshErr) html += `<p class="err">${esc(st.freshErr)}</p>`;
+    if (st.freshBusy) html += loading("Checking your services…");
+    else if (st.fresh && st.fresh.length) html += `<div>${st.fresh.map((r,i)=>recCard(r,i,"fresh")).join("")}</div>`;
+    else if (st.fresh) html += `<p class="note">Nothing new on those services that isn't already on your list.</p>`;
+  }
+  return html + `</section>`;
+}
+function signInHTML(){
+  return `<section class="panel signin" aria-labelledby="siH">
+    <div><h2 id="siH">Sign in to sync</h2><p class="lede">Your lists follow you to every device, and you can share one list with someone else.</p></div>
+    <button class="btn primary" data-action="google" ${st.authBusy?"disabled":""}>Continue with Google</button>
+    <div class="or">or use email</div>
+    <form id="emailForm" class="panel" style="padding:0;border:0" autocomplete="on">
+      <div class="field"><label for="authEmail">Email</label><input id="authEmail" type="email" autocomplete="email" inputmode="email"></div>
+      <div class="field"><label for="authPw">Password</label><input id="authPw" type="password" autocomplete="current-password" minlength="6"></div>
+      <div class="row"><button class="btn primary" type="submit" ${st.authBusy?"disabled":""}>Sign in</button><button class="btn" type="button" data-action="email-create" ${st.authBusy?"disabled":""}>Create account</button></div>
+    </form>
+    ${st.authErr ? `<p class="err">${esc(st.authErr)}</p>` : ""}
+    <hr><button class="btn ghost" data-action="go-local">Use on this device only</button>
+  </section>`;
+}
+function shareSetupHTML(inMain){
+  return `<section class="panel" aria-labelledby="shH">
+    <div><h2 id="shH">Share a list</h2><p class="lede">Our list is one list you both see and edit, with shared progress, ratings and notes. My list stays private to you.</p></div>
+    <div><button class="btn primary" data-action="hh-create" ${st.hhBusy?"disabled":""}>Start a shared list</button></div>
+    <div class="field"><label for="joinCode">Have an invite code?</label>
+      <div class="row"><div class="grow"><input id="joinCode" placeholder="ABCDE-FGH23" autocapitalize="characters" autocomplete="off" spellcheck="false"></div>
+      <button class="btn" data-action="hh-join" ${st.hhBusy?"disabled":""}>Join</button></div></div>
+    ${st.hhErr ? `<p class="err">${esc(st.hhErr)}</p>` : ""}
+  </section>${inMain ? footHTML() : ""}`;
+}
+
+/* ---------- sheets ---------- */
+function openSheet(s){ st.sheet = s; sheetWrap.hidden = false; document.body.classList.add("locked"); renderSheet(); }
+function closeSheet(){ st.sheet = null; sheetWrap.hidden = true; document.body.classList.remove("locked"); }
+function renderSheet(){
+  const s = st.sheet; if (!s) return;
+  if (s.kind==="detail"){
+    const L = listOf(s.id); const it = st.lists[L][s.id]; if (!it){ closeSheet(); return; }
+    sheet.setAttribute("aria-label", it.title); sheet.innerHTML = detailHTML(it, s, L);
+  } else if (s.kind==="settings"){ sheet.setAttribute("aria-label", "Settings"); sheet.innerHTML = settingsHTML(s); }
+  else { sheet.setAttribute("aria-label", "Add a title"); sheet.innerHTML = addHTML(s); }
+}
+function addHTML(s){
+  const hasKey = !!tmdbKey();
+  const modes = hasKey ? [["search","Search"],["bulk","Paste a list"],["manual","By hand"]] : [["manual","By hand"]];
+  if (!hasKey) s.mode = "manual";
+  let h = `<div class="sheet-head"><h2>Add to ${LIST_NAME[st.list]}</h2><button class="x" data-action="close-sheet" aria-label="Close">×</button></div>
+    <div class="seg" role="group" aria-label="How to add">${modes.map(([k,l])=>`<button class="chipbtn" data-action="add-mode" data-mode="${k}" aria-pressed="${s.mode===k}">${l}</button>`).join("")}</div>`;
+  if (!hasKey) h += `<p class="note">Add a TMDB key in Settings to search titles and fill in posters, seasons and services automatically.</p>`;
+  if (s.mode==="search"){
+    h += `<form class="row" id="searchForm" autocomplete="off"><div class="grow"><input id="q" type="search" enterkeyhint="search" placeholder="Show or movie title" value="${esc(s.q||"")}" aria-label="Title to search"></div><button class="btn primary" type="submit" ${s.loading?"disabled":""}>Search</button></form>`;
+    if (s.err) h += `<p class="err">${esc(s.err)}</p>`;
+    if (s.loading) h += loading("Searching…");
+    if (s.results && !s.loading){
+      if (!s.results.length) h += `<p class="note">No matches. Try another spelling, or add it by hand.</p>`;
+      h += `<div>${s.results.map((r,i) => {
+        const ex = findExisting(r);
+        return `<div class="res">${poster(r)}<div class="body"><h3>${esc(r.title)}</h3>
+          <p class="meta">${[r.year, r.type==="movie" ? "Film" : "TV series"].filter(Boolean).join(" · ")}</p>
+          ${r.overview ? `<p class="overview clamp">${esc(r.overview)}</p>` : ""}
+          <div class="acts">${ex ? `<button class="btn ghost" data-action="open" data-id="${ex.id}">On ${LIST_NAME[st.list]} · ${STATUS_LABEL[ex.status]}</button>`
+            : s.adding===i ? loading("Adding…")
+            : ["want","watching","watched"].map(k=>`<button class="btn ${k==="want"?"primary":""}" data-action="add-result" data-idx="${i}" data-status="${k}">${STATUS_LABEL[k]}</button>`).join("")}</div>
+        </div></div>`; }).join("")}</div>`;
+    }
+  } else if (s.mode==="bulk"){
+    s.bulkStatus = s.bulkStatus || "watched";
+    h += `<div class="field"><label for="bulk">One title per line</label><textarea id="bulk" rows="7" placeholder="Breaking Bad&#10;The Bear&#10;Dune: Part Two&#10;Love Is Blind">${esc(s.bulk||"")}</textarea></div>
+      <div><span class="lbl">Add them as</span><div class="seg" role="group" aria-label="Add them as">${["watched","want","watching"].map(k=>`<button class="chipbtn" data-action="bulk-status" data-s="${k}" aria-pressed="${s.bulkStatus===k}">${STATUS_LABEL[k]}</button>`).join("")}</div></div>
+      <div class="row"><button class="btn primary" data-action="bulk-go" ${s.loading?"disabled":""}>Add all</button><span class="note">Up to 60 at a time. Add a year to pick the right one, like "Shogun 2024".</span></div>`;
+    if (s.loading) h += loading(`Looking up ${s.done||0} of ${s.count||0}…`);
+    if (s.err) h += `<p class="err">${esc(s.err)}</p>`;
+    if (s.result) h += `<p class="note">${esc(s.result)}</p>`;
+  } else {
+    const m = s.m || (s.m = {title:"",type:"tv",year:"",seasons:"",status:"want"});
+    h += `<form id="manualForm" class="panel" style="padding:0;border:0" autocomplete="off">
+      <div class="field"><label for="mTitle">Title</label><input id="mTitle" value="${esc(m.title)}"></div>
+      <div class="seg" role="group" aria-label="Type">${[["tv","TV show"],["movie","Movie"]].map(([k,l])=>`<button type="button" class="chipbtn" data-action="m-type" data-t="${k}" aria-pressed="${m.type===k}">${l}</button>`).join("")}</div>
+      <div class="selrow"><div class="field"><label for="mYear">Year</label><input id="mYear" inputmode="numeric" value="${esc(m.year)}"></div>
+      <div class="field"><label for="mStatus">Add to</label><select id="mStatus">${["want","watching","watched"].map(k=>`<option value="${k}" ${m.status===k?"selected":""}>${STATUS_LABEL[k]}</option>`).join("")}</select></div></div>
+      ${m.type==="tv" ? `<div class="field"><label for="mSeasons">Episodes per season</label><input id="mSeasons" placeholder="10, 10, 8" value="${esc(m.seasons)}"></div>` : ""}
+      <div><button class="btn primary" type="submit">Add</button></div></form>`;
+  }
+  return h;
+}
+function detailHTML(it, s, L){
+  const kv = [];
+  if (it.network) kv.push([it.type==="movie" ? "Studio" : "Network", it.network]);
+  if (it.people) kv.push([it.type==="movie" ? "Credits" : "People", it.people]);
+  if (it.type==="tv" && it.seasons.length) kv.push(["Episodes", `${totalEps(it)} across ${seasonsLabel(it).toLowerCase()} (${it.seasons.join(" / ")})`]);
+  if (it.runtimeMin) kv.push([it.type==="movie" ? "Runtime" : "Episode", fmtRun(it.runtimeMin)]);
+  if (it.showStatus) kv.push(["Status", {returning:"Still airing",ended:"Ended",upcoming:"Coming soon",released:"Released"}[it.showStatus] || it.showStatus]);
+  if (it.nextAir && it.nextAir.date) kv.push(["Next", `${code(it.nextAir.s,it.nextAir.e)} on ${fmtDate(it.nextAir.date)}`]);
+  if (L==="ours" && it.addedBy && memberName(it.addedBy)) kv.push(["Added by", memberName(it.addedBy)]);
+  const ps = platsOf(it), gs = genresOf(it);
+  let h = `<div class="sheet-head"><span class="lbl" style="margin:0">${it.type==="movie"?"Movie":"TV show"} · ${LIST_NAME[L]}</span><button class="x" data-action="close-sheet" aria-label="Close">×</button></div>
+    <div class="detail-top">${poster(it,"lg")}<div class="body"><h3>${esc(it.title)}</h3><p class="meta">${esc(metaLine(it))}</p>
+    ${it.overview ? `<p class="overview">${esc(it.overview)}</p>` : ""}</div></div>
+    ${kv.length ? `<dl class="kv">${kv.map(([k,v])=>`<dt>${k}</dt><dd>${esc(v)}</dd>`).join("")}</dl>` : ""}
+    <hr>
+    <div><span class="lbl">List</span><div class="seg" role="group" aria-label="List">${["want","watching","watched","dropped"].map(k=>`<button class="chipbtn" data-action="set-status" data-id="${it.id}" data-status="${k}" aria-pressed="${it.status===k}">${STATUS_LABEL[k]}</button>`).join("")}</div></div>`;
+  if (it.type==="tv" && it.status!=="want"){
+    const S = it.seasons, p = it.progress||{s:1,e:0}, n = nextEp(it);
+    const sCount = Math.max(S.length, p.s, 1), eMax = S[p.s-1] || Math.max(p.e+5, 10);
+    h += `<div><span class="lbl">Last episode watched</span>
+      <div class="selrow"><select id="pS" data-id="${it.id}" aria-label="Season">${Array.from({length:sCount},(_,i)=>`<option value="${i+1}" ${p.s===i+1?"selected":""}>Season ${i+1}</option>`).join("")}</select>
+      <select id="pE" data-id="${it.id}" aria-label="Episode">${Array.from({length:eMax+1},(_,i)=>`<option value="${i}" ${p.e===i?"selected":""}>${i===0?"Not started":"Episode "+i}</option>`).join("")}</select></div>
+      <div class="row" style="margin-top:10px">${n ? `<button class="btn primary" data-action="next" data-id="${it.id}">Watched <span class="mono">${code(n.s,n.e)}</span></button>` : `<span class="chip c-watched"><span class="dot"></span>Caught up</span>`}
+      <span class="mono note">${watchedEps(it)}${totalEps(it) ? " / " + totalEps(it) : ""} episodes</span></div></div>`;
+  }
+  h += `<div><span class="lbl">Where to watch</span>${s.editWhere || !ps.length
+      ? `${!ps.length && it.tmdbId ? `<p class="note" style="margin-bottom:8px">Not streaming in the US right now. Pick a service if you know one.</p>` : ""}<div class="chips">${PLATFORMS.map(([p,c])=>`<button class="chipbtn" data-action="edit-plat" data-id="${it.id}" data-v="${esc(p)}" aria-pressed="${ps.includes(p)}"><i class="sw" style="--c:${c}"></i>${esc(p)}</button>`).join("")}</div>${ps.length ? `<button class="btn ghost" style="margin-top:8px" data-action="edit-where-done">Done</button>` : ""}`
+      : `<div class="row">${svcBadges(it)}<button class="btn ghost" data-action="edit-where">Change</button>${it.providerLink ? `<a class="btn ghost" href="${esc(it.providerLink)}" target="_blank" rel="noopener">All options ↗</a>` : ""}</div>`}</div>
+    <div><span class="lbl">Type</span>${s.editType
+      ? `<div class="chips">${GENRES.map(g=>`<button class="chipbtn" data-action="edit-genre" data-id="${it.id}" data-v="${esc(g)}" aria-pressed="${gs.includes(g)}">${esc(g)}</button>`).join("")}</div><button class="btn ghost" style="margin-top:8px" data-action="edit-type-done">Done</button>`
+      : `<div class="row"><span class="meta">${esc(gs.join(" / ") || "Not set")}</span><button class="btn ghost" data-action="edit-type">Change</button></div>`}</div>
+    <div><span class="lbl">Rating${L==="ours" ? " (shared)" : ""}</span><div class="seg" role="group" aria-label="Rating">${RATINGS.map(([v,l])=>`<button class="chipbtn" data-action="rate" data-id="${it.id}" data-v="${v}" aria-pressed="${it.rating===v}">${l}</button>`).join("")}</div></div>
+    <div class="field"><label for="notes">Notes</label><textarea id="notes" data-id="${it.id}" placeholder="Where you left off, who recommended it…">${esc(it.notes||"")}</textarea></div>`;
+  if (s.err) h += `<p class="err">${esc(s.err)}</p>`;
+  const canMove = st.mode==="cloud" && st.household;
+  h += `<div class="row">
+    ${tmdbKey() ? `<button class="btn" data-action="refresh" data-id="${it.id}" ${s.loading?"disabled":""}>${s.loading ? "Checking…" : it.tmdbId ? "Refresh details" : "Match on TMDB"}</button>` : ""}
+    ${canMove ? `<button class="btn" data-action="move" data-id="${it.id}">Move to ${LIST_NAME[L==="ours"?"mine":"ours"]}</button>` : ""}
+    ${s.confirm ? `<span class="note">Remove ${esc(it.title)}?</span><button class="btn danger" data-action="remove-yes" data-id="${it.id}">Remove</button><button class="btn ghost" data-action="remove-no">Keep</button>`
+      : `<button class="btn ghost danger" data-action="remove" data-id="${it.id}">Remove</button>`}</div>`;
+  return h;
+}
+function settingsHTML(s){
+  let h = `<div class="sheet-head"><h2>Settings</h2><button class="x" data-action="close-sheet" aria-label="Close">×</button></div>`;
+  // Account
+  h += `<section class="field"><span class="lbl">Account</span>`;
+  if (st.mode==="cloud" && st.user) h += `<div class="row"><span>Signed in as <b>${esc(st.user.email || st.user.name)}</b></span><button class="btn ghost" data-action="sign-out">Sign out</button></div>`;
+  else if (HAS_FB) h += `<div class="row"><span class="note">This device only. Sign in to sync your list and share one.</span><button class="btn" data-action="go-cloud">Sign in</button></div>`;
+  else h += `<p class="note">This device only. To sync across phones and share a list, set up Firebase using SETUP.md in the GitHub repo.</p>`;
+  h += `</section><hr>`;
+  // Sharing
+  if (st.mode==="cloud" && st.user){
+    h += `<section class="field"><span class="lbl">Shared list</span>`;
+    if (st.household && !st.household.loading){
+      const names = (st.household.members||[]).map(m => m===uid() ? "You" : (st.household.names||{})[m] || "Someone");
+      h += `<p class="note" style="margin-bottom:8px">Invite code. Whoever enters it under Our list joins your shared list.</p>
+        <div class="row"><span class="code" id="inviteCode">${fmtCode(st.household.id)}</span><button class="btn" data-action="copy-code">Copy</button></div>
+        <p class="note" style="margin-top:8px">On it: ${esc(names.join(", "))}</p>
+        <div class="row" style="margin-top:8px">${s.leave ? `<span class="note">Leave Our list? Titles stay with the others.</span><button class="btn danger" data-action="hh-leave-yes">Leave</button><button class="btn ghost" data-action="hh-leave-no">Stay</button>` : `<button class="btn ghost danger" data-action="hh-leave">Leave shared list</button>`}</div>`;
+    } else h += shareSetupHTML(false);
+    h += `</section><hr>`;
+  }
+  // TMDB
+  const k = tmdbKey();
+  h += `<section class="field"><span class="lbl">TMDB key</span>
+    <p class="note" style="margin-bottom:8px">${k ? "Connected. Posters, seasons, categories and services come from TMDB." : `Get a free key at <a href="https://www.themoviedb.org/settings/api" target="_blank" rel="noopener">themoviedb.org/settings/api</a>, then paste the API Key or the Read Access Token here.`}
+    ${st.household ? " Saving it here also shares it with everyone on Our list." : ""}</p>
+    <form id="keyForm" class="row" autocomplete="off"><div class="grow"><input id="tmdbKeyIn" type="password" placeholder="${k ? "••••••••  (saved)" : "Paste key"}" spellcheck="false" aria-label="TMDB key"></div><button class="btn primary" type="submit">Save</button></form>
+    ${s.keyMsg ? `<p class="${s.keyOk ? "note" : "err"}" style="margin-top:6px">${esc(s.keyMsg)}</p>` : ""}
+  </section><hr>`;
+  // Maintenance
+  if (k){
+    h += `<section class="field"><span class="lbl">Keep it current</span>
+      <p class="note" style="margin-bottom:8px">Shows you're watching update on their own about twice a day. This updates everything on ${LIST_NAME[st.list]} now: new seasons, air dates and where each title streams.</p>
+      <div><button class="btn" data-action="update-all" ${st.updBusy?"disabled":""}>${st.updBusy ? "Updating…" : "Update all titles"}</button></div></section><hr>`;
+  }
+  h += `<p class="note">This product uses the TMDB API but is not endorsed or certified by TMDB. Streaming availability is provided by JustWatch.</p>`;
+  return h;
+}
+
+/* ---------- actions ---------- */
+async function lookupOne(line){
+  const m = line.match(/^(.*?)[\s(]+((?:19|20)\d{2})\)?\s*$/);
+  const q = (m ? m[1] : line).trim(), y = m ? +m[2] : null;
+  const res = await searchTitles(q);
+  if (!res.length) return null;
+  let best = y ? res.find(r => r.year===y) : null;
+  if (!best){
+    const exact = res.filter(r => norm(r.title)===norm(q));
+    best = (exact.length ? exact : res).sort((a,b) => b.popularity-a.popularity)[0];
+  }
+  return details(best.type, best.tmdbId);
+}
+const A = {
+  "tab": el => { st.tab = el.dataset.tab; lsSet("wl.tab", st.tab); if (st.sheet) closeSheet(); render(true); window.scrollTo({top:0}); },
+  "list": el => { st.list = el.dataset.l; lsSet("wl.list", st.list); st.cat = ""; st.plat = ""; lsSet("wl.cat",""); lsSet("wl.plat",""); render(true); window.scrollTo({top:0}); },
+  "settings": () => openSheet({kind:"settings"}),
+  "open-add": el => { openSheet({kind:"add", mode: tmdbKey() ? (el.dataset.mode||"search") : "manual"}); focusFirst(); },
+  "close-sheet": () => closeSheet(),
+  "add-mode": el => { st.sheet.mode = el.dataset.mode; st.sheet.err = ""; renderSheet(); focusFirst(); },
+  "open": (el,id) => openSheet({kind:"detail", id}),
+  "next": (el,id) => markNext(id),
+  "start": (el,id) => { const L = listOf(id), it = clean(st.lists[L][id]); applyStatus(it,"watching"); upsert(it, L); toast(`Started ${it.title}`); },
+  "finish": (el,id) => { const L = listOf(id), it = clean(st.lists[L][id]); applyStatus(it,"watched"); upsert(it, L); toast(`Marked ${it.title} watched`); },
+  "set-status": (el,id) => { const L = listOf(id), it = clean(st.lists[L][id]); const k = el.dataset.status; if (it.status===k) return; applyStatus(it,k); upsert(it, L); },
+  "rate": (el,id) => { const L = listOf(id), it = clean(st.lists[L][id]); const v = +el.dataset.v; it.rating = it.rating===v ? null : v; upsert(it, L); },
+  "remove": () => { st.sheet.confirm = true; renderSheet(); },
+  "remove-no": () => { st.sheet.confirm = false; renderSheet(); },
+  "remove-yes": (el,id) => { const L = listOf(id); const t = st.lists[L][id] && st.lists[L][id].title; closeSheet(); delete st.lists[L][id]; backend.deleteItem(id, L); render(true); toast(`Removed ${t}`); },
+  "move": (el,id) => {
+    const from = listOf(id), to = from==="ours" ? "mine" : "ours";
+    const it = clean(st.lists[from][id]);
+    const dup = findIn(to, it);
+    if (dup){ toast(`${it.title} is already on ${LIST_NAME[to]}`); return; }
+    if (to==="ours" && !it.addedBy) it.addedBy = uid();
+    delete st.lists[from][id]; backend.deleteItem(id, from);
+    it.updatedAt = Date.now(); st.lists[to][id] = it; backend.saveItem(it, to);
+    closeSheet(); render(true); toast(`Moved ${it.title} to ${LIST_NAME[to]}`);
+  },
+  "edit-where": () => { st.sheet.editWhere = true; renderSheet(); },
+  "edit-where-done": () => { st.sheet.editWhere = false; renderSheet(); },
+  "edit-type": () => { st.sheet.editType = true; renderSheet(); },
+  "edit-type-done": () => { st.sheet.editType = false; renderSheet(); },
+  "edit-plat": (el,id) => { const L = listOf(id), it = clean(st.lists[L][id]); const v = el.dataset.v, a = platsOf(it); it.platforms = a.includes(v) ? a.filter(x=>x!==v) : [...a,v]; it.platformsManual = true; st.sheet.editWhere = true; upsert(it, L); },
+  "edit-genre": (el,id) => { const L = listOf(id), it = clean(st.lists[L][id]); const v = el.dataset.v, a = genresOf(it); it.genres = a.includes(v) ? a.filter(x=>x!==v) : [...a,v].slice(-4); it.genresManual = true; upsert(it, L); },
+  "refresh": async (el,id) => {
+    const s = st.sheet; const L = listOf(id); const it0 = st.lists[L][id];
+    s.loading = true; s.err = ""; renderSheet();
+    try {
+      let m;
+      if (it0.tmdbId) m = await details(it0.type, it0.tmdbId, true);
+      else {
+        const res = (await searchTitles(it0.title)).filter(r => r.type===it0.type);
+        const best = (it0.year && res.find(r => r.year===it0.year)) || res[0];
+        if (!best) throw {code:"nomatch"};
+        m = await details(best.type, best.tmdbId);
+      }
+      const cur = st.lists[L][id]; if (!cur) return;
+      const before = (cur.seasons||[]).length;
+      const merged = mergeMeta(cur, m); upsert(merged, L);
+      toast(merged.type==="tv" && before && merged.seasons.length > before ? `New season found: Season ${merged.seasons.length}` : "Details updated");
+    } catch(e){ s.err = e.code==="nomatch" ? "Couldn't find this title on TMDB. Check the spelling of the title." : tmdbErr(e); }
+    s.loading = false; if (st.sheet===s) renderSheet();
+  },
+  "add-result": async el => {
+    const s = st.sheet; const i = +el.dataset.idx; const r = s.results[i]; const k = el.dataset.status;
+    s.adding = i; renderSheet();
+    try { const m = await details(r.type, r.tmdbId); const it = addFromMeta(m, k); toast(`${it.title} added to ${STATUS_LABEL[it.status]}`); }
+    catch(e){ s.err = tmdbErr(e); }
+    s.adding = null; if (st.sheet===s) renderSheet();
+  },
+  "bulk-status": el => { st.sheet.bulkStatus = el.dataset.s; renderSheet(); },
+  "bulk-go": async () => {
+    const s = st.sheet; const L = st.list;
+    const lines = (s.bulk||"").split(/\n|;/).map(x=>x.trim()).filter(Boolean);
+    if (!lines.length){ s.err = "Add at least one title, one per line."; renderSheet(); return; }
+    const batch = lines.slice(0,60); s.loading = true; s.err = ""; s.result = ""; s.count = batch.length; s.done = 0; renderSheet();
+    let added = 0, dup = 0; const miss = [];
+    try {
+      await pool(batch, 3, async line => {
+        let m = null;
+        try { m = await lookupOne(line); } catch(e){ if (e.code==="badkey" || e.code==="nokey" || e.code==="offline") throw e; }
+        s.done++; if (st.sheet===s) renderSheet();
+        if (!m){ miss.push(line); return; }
+        if (findIn(L, m)){ dup++; return; }
+        const it = makeItem(m, s.bulkStatus, L); st.lists[L][it.id] = it; backend.saveItem(it, L); added++;
+      });
+      s.bulk = lines.slice(60).join("\n");
+      s.result = `Added ${added}.` + (dup ? ` Skipped ${dup} already on your list.` : "") + (miss.length ? ` Couldn't find: ${miss.join(", ")}.` : "") + (lines.length > 60 ? ` ${lines.length-60} lines left to add.` : "");
+      if (added && s.bulkStatus!=="watching"){ st.tab = s.bulkStatus; lsSet("wl.tab", st.tab); }
+    } catch(e){ s.err = tmdbErr(e); }
+    s.loading = false; render(true);
+  },
+  "m-type": el => { readManual(); st.sheet.m.type = el.dataset.t; renderSheet(); },
+  "match-all": async () => {
+    if (st.fillBusy) return; const L = st.list;
+    const list = Object.values(st.lists[L]).filter(x => !x.tmdbId && !x.lookedUp).slice(0,60); if (!list.length) return;
+    st.fillBusy = true; render(true); let n = 0;
+    try {
+      await pool(list, 3, async x => {
+        let m = null; try { m = await lookupOne(x.title + (x.year ? " " + x.year : "")); } catch(e){ if (e.code==="badkey"||e.code==="nokey"||e.code==="offline") throw e; }
+        const cur = st.lists[L][x.id]; if (!cur) return;
+        let it = clean(cur);
+        if (m && m.type===cur.type){ it = mergeMeta(it, m); n++; } else it.lookedUp = true;
+        it.updatedAt = cur.updatedAt; st.lists[L][it.id] = it; backend.saveItem(it, L);
+      });
+      toast(`Matched ${n} of ${list.length}`);
+    } catch(e){ toast(tmdbErr(e)); }
+    st.fillBusy = false; render(true);
+  },
+  "update-all": async () => {
+    if (st.updBusy) return; const L = st.list;
+    const list = Object.values(st.lists[L]).filter(x => x.tmdbId);
+    st.updBusy = true; renderSheet(); let newS = 0;
+    try {
+      await pool(list, 4, async x => {
+        const m = await details(x.type, x.tmdbId, true).catch(e => { if (e.code==="badkey"||e.code==="offline") throw e; return null; });
+        const cur = st.lists[L][x.id]; if (!m || !cur) return;
+        const merged = mergeMeta(cur, m); if (merged.newAt && merged.newAt !== cur.newAt) newS++;
+        merged.updatedAt = cur.updatedAt; st.lists[L][x.id] = merged; backend.saveItem(merged, L);
+      });
+      toast(newS ? `Updated. ${newS} show${newS>1?"s have":" has"} new episodes.` : `Updated ${list.length} titles`);
+    } catch(e){ toast(tmdbErr(e)); }
+    st.updBusy = false; render(true);
+  },
+  "genre": el => { const g = el.dataset.g, a = st.profile.genres; st.profile.genres = a.includes(g) ? a.filter(x=>x!==g) : [...a,g]; backend.saveProfile(); render(true); },
+  "service": el => { const v = el.dataset.s, a = st.profile.services||[]; st.profile.services = a.includes(v) ? a.filter(x=>x!==v) : [...a,v]; st.fresh = null; backend.saveProfile(); render(true); },
+  "kind": el => { st.profile.kind = el.dataset.k; st.fresh = null; backend.saveProfile(); render(true); },
+  "cat": el => { st.cat = el.dataset.v; lsSet("wl.cat", st.cat); render(true); },
+  "plat": el => { st.plat = el.dataset.v; lsSet("wl.plat", st.plat); render(true); },
+  "picks": async () => {
+    if (st.picksBusy) return; const L = st.list; st.picksBusy = true; st.picksErr = ""; render(true);
+    try { const items = await buildPicks(); st.picks[L] = {items, at:Date.now()}; savePicksLocal(); }
+    catch(e){ st.picksErr = tmdbErr(e); }
+    st.picksBusy = false; render(true);
+  },
+  "fresh": async () => {
+    if (st.freshBusy) return; st.freshBusy = true; st.freshErr = ""; render(true);
+    try { st.fresh = await buildFresh(); } catch(e){ st.freshErr = tmdbErr(e); }
+    st.freshBusy = false; render(true);
+  },
+  "rec-add": el => {
+    const src = el.dataset.src === "fresh" ? st.fresh : (st.picks[st.list]||{}).items; const r = src && src[+el.dataset.idx]; if (!r) return;
+    const it = addFromMeta(r, el.dataset.status); toast(`${it.title} added to ${STATUS_LABEL[it.status]}`);
+  },
+  "rec-dismiss": el => {
+    const fresh = el.dataset.src==="fresh"; const arr = fresh ? st.fresh : (st.picks[st.list]||{}).items; const i = +el.dataset.idx; const r = arr && arr[i]; if (!r) return;
+    const k = r.type + ":" + r.tmdbId;
+    st.profile.dismissed = [...(st.profile.dismissed||[]).filter(x => x!==k), k].slice(-400);
+    arr.splice(i,1); if (!fresh) savePicksLocal();
+    backend.saveProfile(); render(true); toast(`Won't suggest ${r.title} again`);
+  },
+  "google": () => googleSignIn(),
+  "email-create": () => emailAuth(true),
+  "go-local": () => { lsSet("wl.local","1"); startLocal(); },
+  "go-cloud": () => { lsSet("wl.local", null); location.reload(); },
+  "sign-out": async () => { closeSheet(); stopAll(); await auth.signOut(); },
+  "hh-create": async () => {
+    st.hhBusy = true; st.hhErr = ""; render(true);
+    try { await createHousehold(); st.list = "ours"; lsSet("wl.list","ours"); toast("Shared list started. Send your invite code from Settings."); }
+    catch(e){ st.hhErr = hhErrCopy(e); }
+    st.hhBusy = false; render(true);
+  },
+  "hh-join": async () => {
+    const v = ($("joinCode")||{}).value || "";
+    st.hhBusy = true; st.hhErr = ""; render(true);
+    try { await joinHousehold(v); st.list = "ours"; lsSet("wl.list","ours"); toast("You're on the shared list"); }
+    catch(e){ st.hhErr = hhErrCopy(e); }
+    st.hhBusy = false; render(true);
+  },
+  "hh-leave": () => { st.sheet.leave = true; renderSheet(); },
+  "hh-leave-no": () => { st.sheet.leave = false; renderSheet(); },
+  "hh-leave-yes": async () => { await leaveHousehold(); st.list = "mine"; lsSet("wl.list","mine"); closeSheet(); render(true); toast("You left the shared list"); },
+  "copy-code": async () => {
+    const c = fmtCode(st.household && st.household.id);
+    try { await navigator.clipboard.writeText(c); toast("Invite code copied"); }
+    catch(e){ const el = $("inviteCode"); if (el){ const r = document.createRange(); r.selectNodeContents(el); const sel = getSelection(); sel.removeAllRanges(); sel.addRange(r); } toast("Select the code and copy it"); }
+  }
+};
+function readManual(){
+  const m = st.sheet && st.sheet.m; if (!m) return;
+  const g = id => { const el = $(id); return el ? el.value : undefined; };
+  if (g("mTitle")!==undefined) m.title = g("mTitle");
+  if (g("mYear")!==undefined) m.year = g("mYear");
+  if (g("mStatus")!==undefined) m.status = g("mStatus");
+  if (g("mSeasons")!==undefined) m.seasons = g("mSeasons");
+}
+function focusFirst(){ setTimeout(()=>{ const el = sheet.querySelector("#q,#bulk,#mTitle"); if (el && matchMedia("(hover: hover)").matches) el.focus(); }, 30); }
+
+document.addEventListener("click", e => {
+  const el = e.target.closest("[data-action]"); if (!el) return;
+  const f = A[el.dataset.action]; if (!f) return;
+  e.stopPropagation(); f(el, el.dataset.id, e);
+});
+document.addEventListener("keydown", e => {
+  if (e.key==="Escape" && st.sheet){ closeSheet(); return; }
+  if ((e.key==="Enter" || e.key===" ") && e.target.classList && e.target.classList.contains("card")){ e.preventDefault(); A.open(e.target, e.target.dataset.id); }
+});
+document.addEventListener("submit", async e => {
+  e.preventDefault();
+  const id = e.target.id;
+  if (id==="searchForm"){
+    const s = st.sheet; const q = ($("q").value||"").trim(); if (!q) return;
+    s.q = q; s.loading = true; s.err = ""; renderSheet();
+    try { s.results = await searchTitles(q); } catch(err){ s.err = tmdbErr(err); s.results = null; }
+    s.loading = false; if (st.sheet===s) renderSheet();
+    document.activeElement && document.activeElement.blur && document.activeElement.blur();
+  } else if (id==="manualForm"){
+    readManual(); const m = st.sheet.m; const title = m.title.trim();
+    if (!title){ $("mTitle").focus(); return; }
+    const seasons = m.type==="tv" ? (m.seasons||"").split(/[^0-9]+/).map(Number).filter(n=>n>0) : [];
+    const ex = findExisting({title, type:m.type});
+    if (ex){ openSheet({kind:"detail", id:ex.id}); toast("Already on your list"); return; }
+    const it = makeItem({title, type:m.type, year:+m.year||null, seasons}, m.status, st.list); upsert(it, st.list);
+    st.sheet.m = {title:"",type:m.type,year:"",seasons:"",status:m.status}; renderSheet();
+    toast(`${title} added to ${STATUS_LABEL[it.status]}`);
+  } else if (id==="emailForm"){
+    emailAuth(false);
+  } else if (id==="keyForm"){
+    const s = st.sheet; const v = ($("tmdbKeyIn").value||"").trim();
+    if (!v){ s.keyMsg = "Paste your key first."; s.keyOk = false; renderSheet(); return; }
+    const old = lsGet("wl.tmdb"); lsSet("wl.tmdb", v); cache.clear(); genreIdx = null; provIdx = null;
+    try {
+      await tmdb("/configuration");
+      s.keyMsg = "Saved. TMDB is connected."; s.keyOk = true;
+      if (st.mode==="cloud" && st.user){
+        backend.saveUser({tmdbKey:v}).catch(()=>{});
+        if (st.household) fs.doc(`households/${st.household.id}`).update({tmdbKey:v}).catch(()=>{});
+      }
+      scheduleRefresh();
+    } catch(err){ lsSet("wl.tmdb", old); s.keyMsg = tmdbErr(err); s.keyOk = false; }
+    render(true);
+  }
+});
+document.addEventListener("input", e => {
+  const t = e.target;
+  if (t.id==="filter"){ st.filter = t.value; renderMain(); }
+  else if (t.id==="q" && st.sheet) st.sheet.q = t.value;
+  else if (t.id==="bulk" && st.sheet) st.sheet.bulk = t.value;
+});
+document.addEventListener("change", e => {
+  const t = e.target;
+  if (t.id==="recent"){ st.profile.recent = t.checked; backend.saveProfile(); }
+  else if (t.id==="onlyMine"){ st.profile.onlyMine = t.checked; backend.saveProfile(); }
+  else if (t.id==="notes"){ const L = listOf(t.dataset.id), it = clean(st.lists[L][t.dataset.id]); if (it.notes !== t.value){ it.notes = t.value.slice(0,2000); upsert(it, L); } }
+  else if (t.id==="pS" || t.id==="pE"){
+    const L = listOf(t.dataset.id), it = clean(st.lists[L][t.dataset.id]);
+    const s = +$("pS").value; let ep = +$("pE").value;
+    if (t.id==="pS") ep = Math.min(ep, it.seasons[s-1] || ep);
+    it.progress = {s, e:ep};
+    if (it.status==="want") it.status = "watching";
+    upsert(it, L);
+  }
+});
+
+/* ---------- start ---------- */
+function startLocal(){
+  stopAll(); st.mode = "local"; st.user = null; st.household = null; st.lists.ours = {};
+  backend = localBackend(); render(true); scheduleRefresh();
+}
+function init(){
+  if (!HAS_FB || lsGet("wl.local")==="1"){ startLocal(); return; }
+  try {
+    firebase.initializeApp(FB_CFG);
+    auth = firebase.auth(); fs = firebase.firestore();
+    fs.enablePersistence({synchronizeTabs:true}).catch(()=>{});
+  } catch(e){ startLocal(); return; }
+  st.mode = "cloud"; render(true);
+  auth.getRedirectResult().catch(e => { st.authErr = authCopy(e); render(true); });
+  auth.onAuthStateChanged(u => {
+    st.authReady = true;
+    if (lsGet("wl.local")==="1") return;
+    if (u) startCloud(u);
+    else { stopAll(); st.user = null; st.ready = false; st.mode = "cloud"; st.lists = {mine:{}, ours:{}}; st.household = null; render(true); }
+  });
+}
+init();
+})();

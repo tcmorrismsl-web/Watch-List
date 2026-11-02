@@ -1,0 +1,43 @@
+rules_version = '2';
+
+// Watch List security rules.
+// - Each person's private list and settings live under users/{their id}; only they can touch them.
+// - A shared list lives under households/{invite code}. Members can read and edit it.
+//   Someone who isn't a member can only add themselves, and only if they know the 10-character code.
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    match /users/{uid} {
+      allow read, write: if request.auth != null && request.auth.uid == uid;
+      match /{rest=**} {
+        allow read, write: if request.auth != null && request.auth.uid == uid;
+      }
+    }
+
+    function isMember(hid) {
+      return request.auth != null
+        && request.auth.uid in get(/databases/$(database)/documents/households/$(hid)).data.members;
+    }
+
+    match /households/{hid} {
+      allow create: if request.auth != null
+        && request.resource.data.members == [request.auth.uid];
+
+      allow read: if request.auth != null && request.auth.uid in resource.data.members;
+
+      allow update: if request.auth != null && (
+        request.auth.uid in resource.data.members
+        || (
+          request.resource.data.diff(resource.data).affectedKeys().hasOnly(['members', 'names'])
+          && request.resource.data.members.hasAll(resource.data.members)
+          && request.resource.data.members.size() == resource.data.members.size() + 1
+          && request.auth.uid in request.resource.data.members
+        )
+      );
+
+      match /items/{itemId} {
+        allow read, write: if isMember(hid);
+      }
+    }
+  }
+}
