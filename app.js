@@ -1427,6 +1427,26 @@ document.addEventListener("change", e => {
   }
 });
 
+/* ---------- updates ---------- */
+// When a newer version is published: reload on its own when you come back to the app,
+// or offer a Reload button if you're in the middle of using it.
+let updateShown = false;
+async function checkForUpdate(fromResume){
+  const cur = window.WL_VERSION; if (!cur) return;
+  let v = "";
+  try { const r = await fetch("version.txt?" + Date.now(), {cache:"no-store"}); if (r.ok) v = (await r.text()).trim(); } catch(e){ return; }
+  if (!v || v === cur) return;
+  const busy = st.sheet || typingIn(document.body) || st.picksBusy || st.fillBusy || st.updBusy;
+  if (fromResume && !busy){ location.reload(); return; }
+  if (updateShown) return; updateShown = true;
+  const t = $("toast"); clearTimeout(toastTimer);
+  t.innerHTML = `New version ready <button class="btn" style="margin-left:10px;min-height:30px;padding:6px 10px" data-action="reload-app">Reload</button>`;
+  t.hidden = false;
+}
+document.addEventListener("visibilitychange", () => { if (document.visibilityState==="visible") checkForUpdate(true); });
+setInterval(() => { if (document.visibilityState==="visible") checkForUpdate(false); }, 60000);
+A["reload-app"] = () => location.reload();
+
 /* ---------- start ---------- */
 function startLocal(){
   stopAll(); st.mode = "local"; st.user = null; st.household = null; st.lists.ours = {};
