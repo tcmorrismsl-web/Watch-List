@@ -136,6 +136,10 @@ main{padding-top:14px;display:flex;flex-direction:column;gap:22px}
 .chips{display:flex;flex-wrap:wrap;gap:6px}
 .chipbtn{appearance:none;border:1px solid var(--line);background:var(--surface);color:var(--fg);font:500 13px/1 var(--f-body);padding:8px 11px;border-radius:999px;cursor:pointer;display:inline-flex;align-items:center}
 .chipbtn[aria-pressed="true"]{background:var(--fg);border-color:var(--fg);color:var(--bg)}
+.rate{display:flex;flex-wrap:wrap;gap:5px}
+.rate .chipbtn{padding:7px 10px;font-size:12.5px}
+.ratebig{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+.ratebig .chipbtn{justify-content:center;padding:16px 12px;font-size:16px;font-weight:600;border-radius:12px}
 .chipbtn .n{font:400 11px var(--f-mono);margin-left:6px;opacity:.7}
 .sw{display:inline-block;width:9px;height:9px;border-radius:2px;background:var(--c);margin-right:7px;box-shadow:0 0 0 1px rgba(128,128,128,.35);flex:none}
 .svcs{display:flex;flex-wrap:wrap;gap:5px;align-items:center}
@@ -240,6 +244,6 @@ hr{border:0;border-top:1px solid var(--line);margin:0}
 <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-auth-compat.js"></script>
 <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore-compat.js"></script>
 <script src="config.js?v=1"></script>
-<script src="app.js?v=1"></script>
+<script src="app.js?v=2"></script>
 </body>
 </html>

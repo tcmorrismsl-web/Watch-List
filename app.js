@@ -292,12 +292,13 @@ function markNext(id){
   const S = it.seasons;
   if (S.length && n.e === S[n.s-1]){
     if (n.s === S.length){
-      if (it.showStatus==="ended"){ it.status = "watched"; it.finishedAt = Date.now(); msg = `Finished ${it.title}. Rate it under Watched.`; }
+      if (it.showStatus==="ended"){ it.status = "watched"; it.finishedAt = Date.now(); msg = ""; }
       else msg = it.nextAir && it.nextAir.date ? `Caught up. Next episode ${fmtDate(it.nextAir.date)}.` : `Caught up on ${it.title}`;
       delete it.newAt;
     } else msg = `Finished season ${n.s}`;
   }
-  upsert(it, L); toast(msg);
+  upsert(it, L);
+  if (msg) toast(msg); else askRating(it);
 }
 
 /* ---------- storage backends ---------- */
@@ -650,9 +651,12 @@ function footHTML(){
   bits.push("Show data from TMDB. Streaming availability from JustWatch, for the US.");
   return `<footer class="foot">${bits.map(b=>`<p class="note">${b}</p>`).join("")}</footer>`;
 }
+function rateRow(it){
+  return `<div class="rate" role="group" aria-label="Rate ${esc(it.title)}">${RATINGS.map(([v,l])=>`<button class="chipbtn" data-action="rate" data-id="${it.id}" data-v="${v}" aria-pressed="${it.rating===v}">${l}</button>`).join("")}</div>`;
+}
 function ratingChip(it){
   const r = RATINGS.find(q=>q[0]===it.rating);
-  return r ? `<span class="chip r-${r[0]}">${r[1]}</span>` : `<button class="btn ghost" data-action="open" data-id="${it.id}">Rate it</button>`;
+  return r ? `<span class="chip r-${r[0]}">${r[1]}</span>` : rateRow(it);
 }
 function cardHTML(it){
   let prog = "", acts = "";
@@ -663,10 +667,11 @@ function cardHTML(it){
     acts = n ? `${isNew ? `<span class="chip new">New episodes</span>` : ""}<button class="btn primary" data-action="next" data-id="${it.id}">Watched <span class="mono">${code(n.s,n.e)}</span></button>`
              : it.nextAir && it.nextAir.date ? `<span class="chip">Next episode ${esc(fmtDate(it.nextAir.date))}</span>`
              : `<span class="chip c-watched"><span class="dot"></span>Caught up</span>`;
+    acts += `<button class="btn ghost" data-action="finish" data-id="${it.id}">Finished</button>`;
   } else if (it.status==="watching"){
     acts = `<button class="btn primary" data-action="finish" data-id="${it.id}">Finished it</button>`;
   } else if (it.status==="want"){
-    acts = it.type==="tv" ? `<button class="btn" data-action="start" data-id="${it.id}">Start watching</button>` : `<button class="btn" data-action="finish" data-id="${it.id}">Watched it</button>`;
+    acts = it.type==="tv" ? `<button class="btn" data-action="start" data-id="${it.id}">Start watching</button><button class="btn ghost" data-action="finish" data-id="${it.id}">Seen it</button>` : `<button class="btn" data-action="finish" data-id="${it.id}">Watched it</button>`;
     if (it.showStatus==="upcoming" && it.nextAir && it.nextAir.date) acts += `<span class="chip">Premieres ${esc(fmtDate(it.nextAir.date))}</span>`;
   } else if (it.status==="watched"){
     acts = (isNew ? `<button class="btn ghost" data-action="start" data-id="${it.id}">New season · resume</button>` : "") + ratingChip(it);
@@ -761,6 +766,9 @@ function renderSheet(){
   if (s.kind==="detail"){
     const L = listOf(s.id); const it = st.lists[L][s.id]; if (!it){ closeSheet(); return; }
     sheet.setAttribute("aria-label", it.title); sheet.innerHTML = detailHTML(it, s, L);
+  } else if (s.kind==="rate"){
+    const it = st.lists[listOf(s.id)][s.id]; if (!it){ closeSheet(); return; }
+    sheet.setAttribute("aria-label", "Rate " + it.title); sheet.innerHTML = rateSheetHTML(it);
   } else if (s.kind==="settings"){ sheet.setAttribute("aria-label", "Settings"); sheet.innerHTML = settingsHTML(s); }
   else { sheet.setAttribute("aria-label", "Add a title"); sheet.innerHTML = addHTML(s); }
 }
@@ -782,9 +790,9 @@ function addHTML(s){
         return `<div class="res">${poster(r)}<div class="body"><h3>${esc(r.title)}</h3>
           <p class="meta">${[r.year, r.type==="movie" ? "Film" : "TV series"].filter(Boolean).join(" · ")}</p>
           ${r.overview ? `<p class="overview clamp">${esc(r.overview)}</p>` : ""}
-          <div class="acts">${ex ? `<button class="btn ghost" data-action="open" data-id="${ex.id}">On ${LIST_NAME[st.list]} · ${STATUS_LABEL[ex.status]}</button>`
+          <div class="acts">${ex ? `<button class="btn ghost" data-action="open" data-id="${ex.id}">On ${LIST_NAME[st.list]} · ${STATUS_LABEL[ex.status]}</button>${ex.status!=="want" ? rateRow(ex) : ""}`
             : s.adding===i ? loading("Adding…")
-            : ["want","watching","watched"].map(k=>`<button class="btn ${k==="want"?"primary":""}" data-action="add-result" data-idx="${i}" data-status="${k}">${STATUS_LABEL[k]}</button>`).join("")}</div>
+            : `<span class="lbl" style="margin:0;width:100%">Add as</span>` + ["watched","watching","want"].map(k=>`<button class="btn" data-action="add-result" data-idx="${i}" data-status="${k}">${k==="watched" ? "Seen it" : STATUS_LABEL[k]}</button>`).join("")}</div>
         </div></div>`; }).join("")}</div>`;
     }
   } else if (s.mode==="bulk"){
@@ -822,14 +830,15 @@ function detailHTML(it, s, L){
     ${it.overview ? `<p class="overview">${esc(it.overview)}</p>` : ""}</div></div>
     ${kv.length ? `<dl class="kv">${kv.map(([k,v])=>`<dt>${k}</dt><dd>${esc(v)}</dd>`).join("")}</dl>` : ""}
     <hr>
-    <div><span class="lbl">List</span><div class="seg" role="group" aria-label="List">${["want","watching","watched","dropped"].map(k=>`<button class="chipbtn" data-action="set-status" data-id="${it.id}" data-status="${k}" aria-pressed="${it.status===k}">${STATUS_LABEL[k]}</button>`).join("")}</div></div>`;
+    <div><span class="lbl">List</span><div class="seg" role="group" aria-label="List">${["want","watching","watched","dropped"].map(k=>`<button class="chipbtn" data-action="set-status" data-id="${it.id}" data-status="${k}" aria-pressed="${it.status===k}">${STATUS_LABEL[k]}</button>`).join("")}</div></div>
+    <div><span class="lbl">Your rating${L==="ours" ? " (shared)" : ""}</span>${rateRow(it)}</div>`;
   if (it.type==="tv" && it.status!=="want"){
     const S = it.seasons, p = it.progress||{s:1,e:0}, n = nextEp(it);
     const sCount = Math.max(S.length, p.s, 1), eMax = S[p.s-1] || Math.max(p.e+5, 10);
-    h += `<div><span class="lbl">Last episode watched</span>
+    h += `<div><span class="lbl">Episode progress · optional</span>
       <div class="selrow"><select id="pS" data-id="${it.id}" aria-label="Season">${Array.from({length:sCount},(_,i)=>`<option value="${i+1}" ${p.s===i+1?"selected":""}>Season ${i+1}</option>`).join("")}</select>
       <select id="pE" data-id="${it.id}" aria-label="Episode">${Array.from({length:eMax+1},(_,i)=>`<option value="${i}" ${p.e===i?"selected":""}>${i===0?"Not started":"Episode "+i}</option>`).join("")}</select></div>
-      <div class="row" style="margin-top:10px">${n ? `<button class="btn primary" data-action="next" data-id="${it.id}">Watched <span class="mono">${code(n.s,n.e)}</span></button>` : `<span class="chip c-watched"><span class="dot"></span>Caught up</span>`}
+      <div class="row" style="margin-top:10px">${n ? `<button class="btn" data-action="next" data-id="${it.id}">Watched <span class="mono">${code(n.s,n.e)}</span></button>${S[n.s-1] && n.e < S[n.s-1] ? `<button class="btn" data-action="season-done" data-id="${it.id}">Finished season ${n.s}</button>` : ""}` : `<span class="chip c-watched"><span class="dot"></span>Caught up</span>`}
       <span class="mono note">${watchedEps(it)}${totalEps(it) ? " / " + totalEps(it) : ""} episodes</span></div></div>`;
   }
   h += `<div><span class="lbl">Where to watch</span>${s.editWhere || !ps.length
@@ -838,7 +847,6 @@ function detailHTML(it, s, L){
     <div><span class="lbl">Type</span>${s.editType
       ? `<div class="chips">${GENRES.map(g=>`<button class="chipbtn" data-action="edit-genre" data-id="${it.id}" data-v="${esc(g)}" aria-pressed="${gs.includes(g)}">${esc(g)}</button>`).join("")}</div><button class="btn ghost" style="margin-top:8px" data-action="edit-type-done">Done</button>`
       : `<div class="row"><span class="meta">${esc(gs.join(" / ") || "Not set")}</span><button class="btn ghost" data-action="edit-type">Change</button></div>`}</div>
-    <div><span class="lbl">Rating${L==="ours" ? " (shared)" : ""}</span><div class="seg" role="group" aria-label="Rating">${RATINGS.map(([v,l])=>`<button class="chipbtn" data-action="rate" data-id="${it.id}" data-v="${v}" aria-pressed="${it.rating===v}">${l}</button>`).join("")}</div></div>
     <div class="field"><label for="notes">Notes</label><textarea id="notes" data-id="${it.id}" placeholder="Where you left off, who recommended it…">${esc(it.notes||"")}</textarea></div>`;
   if (s.err) h += `<p class="err">${esc(s.err)}</p>`;
   const canMove = st.mode==="cloud" && st.household;
@@ -849,6 +857,13 @@ function detailHTML(it, s, L){
       : `<button class="btn ghost danger" data-action="remove" data-id="${it.id}">Remove</button>`}</div>`;
   return h;
 }
+function rateSheetHTML(it){
+  return `<div class="sheet-head"><h2>How was it?</h2><button class="x" data-action="close-sheet" aria-label="Close">×</button></div>
+    <div class="detail-top">${poster(it,"lg")}<div class="body"><h3>${esc(it.title)}</h3><p class="meta">${esc(metaLine(it))}</p></div></div>
+    <div class="ratebig" role="group" aria-label="Rate ${esc(it.title)}">${RATINGS.map(([v,l])=>`<button class="chipbtn" data-action="rate" data-id="${it.id}" data-v="${v}" aria-pressed="${it.rating===v}">${l}</button>`).join("")}</div>
+    <button class="btn ghost" style="align-self:flex-start" data-action="close-sheet">Skip for now</button>`;
+}
+function askRating(it){ if (it && it.rating==null) openSheet({kind:"rate", id:it.id}); }
 function settingsHTML(s){
   let h = `<div class="sheet-head"><h2>Settings</h2><button class="x" data-action="close-sheet" aria-label="Close">×</button></div>`;
   // Account
@@ -910,9 +925,19 @@ const A = {
   "open": (el,id) => openSheet({kind:"detail", id}),
   "next": (el,id) => markNext(id),
   "start": (el,id) => { const L = listOf(id), it = clean(st.lists[L][id]); applyStatus(it,"watching"); upsert(it, L); toast(`Started ${it.title}`); },
-  "finish": (el,id) => { const L = listOf(id), it = clean(st.lists[L][id]); applyStatus(it,"watched"); upsert(it, L); toast(`Marked ${it.title} watched`); },
+  "finish": (el,id) => { const L = listOf(id), it = clean(st.lists[L][id]); applyStatus(it,"watched"); delete it.newAt; upsert(it, L); if (it.rating==null) askRating(it); else toast(`Marked ${it.title} watched`); },
+  "season-done": (el,id) => {
+    const L = listOf(id), it = clean(st.lists[L][id]); const n = nextEp(it); if (!n || !it.seasons[n.s-1]) return;
+    it.progress = {s:n.s, e:it.seasons[n.s-1]}; it.status = "watching"; upsert(it, L); toast(`Finished season ${n.s}`);
+  },
   "set-status": (el,id) => { const L = listOf(id), it = clean(st.lists[L][id]); const k = el.dataset.status; if (it.status===k) return; applyStatus(it,k); upsert(it, L); },
-  "rate": (el,id) => { const L = listOf(id), it = clean(st.lists[L][id]); const v = +el.dataset.v; it.rating = it.rating===v ? null : v; upsert(it, L); },
+  "rate": (el,id) => {
+    const L = listOf(id), it = clean(st.lists[L][id]); const v = +el.dataset.v;
+    const fromPrompt = st.sheet && st.sheet.kind==="rate";
+    it.rating = it.rating===v && !fromPrompt ? null : v; upsert(it, L);
+    if (fromPrompt) closeSheet();
+    const r = RATINGS.find(q => q[0]===it.rating); if (r && (fromPrompt || !st.sheet)) toast(`${it.title}: ${r[1]}`);
+  },
   "remove": () => { st.sheet.confirm = true; renderSheet(); },
   "remove-no": () => { st.sheet.confirm = false; renderSheet(); },
   "remove-yes": (el,id) => { const L = listOf(id); const t = st.lists[L][id] && st.lists[L][id].title; closeSheet(); delete st.lists[L][id]; backend.deleteItem(id, L); render(true); toast(`Removed ${t}`); },
