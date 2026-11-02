@@ -460,6 +460,13 @@ function startCloud(u){
   }, () => { st.ready = true; st.slow = true; render(); }));
 }
 // Titles saved on this device before signing in move into the account once, skipping any already there.
+// Copy a title into the other list as its own record (progress, rating and notes come along).
+function copyItem(it, to){
+  if (findIn(to, it)) return null;
+  const c = clean(it); c.id = newId(); c.updatedAt = Date.now();
+  c.addedBy = to==="ours" ? uid() : null;
+  st.lists[to][c.id] = c; backend.saveItem(c, to); return c;
+}
 function importLocal(id){
   let d = null; try { d = JSON.parse(lsGet("wl.data")||"null"); } catch(e){}
   if (!d || lsGet("wl.imported." + id)) return;
@@ -755,8 +762,8 @@ function renderMain(){
     const arr = all.filter(x=>x.status==="watching").sort((a,b) => fresh(b)-fresh(a) || (b.newAt||0)-(a.newAt||0) || (b.updatedAt||0)-(a.updatedAt||0));
     if (arr.length) html += list(arr);
     else if (none && st.list==="ours") html += emptyBlock("Our list is empty",
-      "Everything here is shared with everyone who joined with your invite code: titles, progress, ratings and notes. Add a title, or open one on My list and move it here.",
-      `<button class="btn primary" data-action="open-add">Add a title</button>`);
+      "Everything here is shared with everyone who joined with your invite code: titles, progress, ratings and notes. Copy titles over from My list, or add new ones.",
+      `<button class="btn primary" data-action="open-copy">Copy from My list</button><button class="btn" data-action="open-add">Add a title</button>`);
     else if (none) html += emptyBlock("Start with what you've seen",
       "Paste a list of shows and movies you've already watched and Watch List fills in posters, seasons, categories and where each one streams. The more you log and rate, the better the picks under For you.",
       `<button class="btn primary" data-action="open-add" data-mode="browse">Browse a service</button><button class="btn" data-action="open-add" data-mode="bulk">Paste a list</button><button class="btn" data-action="open-add" data-mode="search">Search a title</button>`);
@@ -943,6 +950,7 @@ function renderSheet(){
   } else if (s.kind==="rate"){
     const it = st.lists[listOf(s.id)][s.id]; if (!it){ closeSheet(); return; }
     sheet.setAttribute("aria-label", "Rate " + it.title); sheet.innerHTML = rateSheetHTML(it);
+  } else if (s.kind==="copy"){ sheet.setAttribute("aria-label", "Copy to Our list"); sheet.innerHTML = copySheetHTML(s);
   } else if (s.kind==="settings"){ sheet.setAttribute("aria-label", "Settings"); sheet.innerHTML = settingsHTML(s); }
   else { sheet.setAttribute("aria-label", "Add a title"); sheet.innerHTML = addHTML(s); }
 }
@@ -1108,7 +1116,8 @@ function detailHTML(it, s, L){
   const canMove = st.mode==="cloud" && st.household;
   h += `<div class="row">
     ${tmdbKey() ? `<button class="btn" data-action="refresh" data-id="${it.id}" ${s.loading?"disabled":""}>${s.loading ? "Checking…" : it.tmdbId ? "Refresh details" : "Match on TMDB"}</button>` : ""}
-    ${canMove ? `<button class="btn" data-action="move" data-id="${it.id}">Move to ${LIST_NAME[L==="ours"?"mine":"ours"]}</button>` : ""}
+    ${canMove ? (findIn(L==="ours"?"mine":"ours", it) ? `<span class="note">Also on ${LIST_NAME[L==="ours"?"mine":"ours"]}</span>`
+      : `<button class="btn" data-action="copy" data-id="${it.id}">Copy to ${LIST_NAME[L==="ours"?"mine":"ours"]}</button><button class="btn ghost" data-action="move" data-id="${it.id}">Move</button>`) : ""}
     ${s.confirm ? `<span class="note">Remove ${esc(it.title)}?</span><button class="btn danger" data-action="remove-yes" data-id="${it.id}">Remove</button><button class="btn ghost" data-action="remove-no">Keep</button>`
       : `<button class="btn ghost danger" data-action="remove" data-id="${it.id}">Remove</button>`}</div>`;
   return h;
@@ -1120,6 +1129,27 @@ function rateSheetHTML(it){
     <button class="btn ghost" style="align-self:flex-start" data-action="close-sheet">Skip for now</button>`;
 }
 function askRating(it){ if (it && it.rating==null) openSheet({kind:"rate", id:it.id}); }
+function copyCandidates(s){
+  return Object.values(st.lists.mine).filter(x => !findIn("ours", x))
+    .filter(x => s.tab==="all" || (s.tab==="watched" ? (x.status==="watched"||x.status==="dropped") : x.status===s.tab))
+    .sort((a,b) => (a.title||"").localeCompare(b.title||""));
+}
+function copySheetHTML(s){
+  const list = copyCandidates(s);
+  const allOn = list.length && list.every(x => s.sel.has(x.id));
+  const tabs = [["all","All"],["watching","Watching"],["want","Up next"],["watched","Watched"]];
+  let h = `<div class="sheet-head"><h2>Copy to Our list</h2><button class="x" data-action="close-sheet" aria-label="Close">×</button></div>
+    <p class="lede">Pick titles from My list. Each copy keeps your progress and rating, and from then on Our list's copy is shared.</p>
+    <div class="seg" role="group" aria-label="Show">${tabs.map(([k,l])=>`<button class="chipbtn" data-action="copy-tab" data-v="${k}" aria-pressed="${s.tab===k}">${l}</button>`).join("")}</div>`;
+  if (!list.length) return h + `<p class="note">${Object.keys(st.lists.mine).length ? "Everything here is already on Our list." : "My list is empty."}</p>`;
+  h += `<div class="row" style="justify-content:space-between"><button class="btn ghost" data-action="copy-all">${allOn ? "Clear" : "Select all"}</button>
+    <button class="btn primary" data-action="copy-go" ${s.sel.size ? "" : "disabled"}>Copy ${s.sel.size || ""} to Our list</button></div><div>`;
+  h += list.map(x => `<button class="pick" data-action="copy-pick" data-id="${x.id}" aria-pressed="${s.sel.has(x.id)}">
+      <span class="box" aria-hidden="true">${s.sel.has(x.id) ? "✓" : ""}</span>${poster(x)}
+      <span class="body"><b>${esc(x.title)}</b><span class="meta">${esc(STATUS_LABEL[x.status])}${x.rating!=null ? " · " + (RATINGS.find(r=>r[0]===x.rating)||[,""])[1] : ""}</span></span>
+    </button>`).join("");
+  return h + `</div>`;
+}
 function settingsHTML(s){
   let h = `<div class="sheet-head"><h2>Settings</h2><button class="x" data-action="close-sheet" aria-label="Close">×</button></div>`;
   // Account
@@ -1136,6 +1166,7 @@ function settingsHTML(s){
       h += `<p class="note" style="margin-bottom:8px">Invite code. Whoever enters it under Our list joins your shared list.</p>
         <div class="row"><span class="code" id="inviteCode">${fmtCode(st.household.id)}</span><button class="btn" data-action="copy-code">Copy</button></div>
         <p class="note" style="margin-top:8px">On it: ${esc(names.join(", "))}</p>
+        <div style="margin-top:8px"><button class="btn" data-action="open-copy">Copy titles from My list</button></div>
         <div class="row" style="margin-top:8px">${s.leave ? `<span class="note">Leave Our list? Titles stay with the others.</span><button class="btn danger" data-action="hh-leave-yes">Leave</button><button class="btn ghost" data-action="hh-leave-no">Stay</button>` : `<button class="btn ghost danger" data-action="hh-leave">Leave shared list</button>`}</div>`;
     } else h += shareSetupHTML(false);
     h += `</section><hr>`;
@@ -1215,6 +1246,21 @@ const A = {
   "remove": () => { st.sheet.confirm = true; renderSheet(); },
   "remove-no": () => { st.sheet.confirm = false; renderSheet(); },
   "remove-yes": (el,id) => { const L = listOf(id); const t = st.lists[L][id] && st.lists[L][id].title; closeSheet(); delete st.lists[L][id]; backend.deleteItem(id, L); render(true); toast(`Removed ${t}`); },
+  "copy": (el,id) => {
+    const from = listOf(id), to = from==="ours" ? "mine" : "ours";
+    const c = copyItem(st.lists[from][id], to);
+    toast(c ? `Copied ${c.title} to ${LIST_NAME[to]}` : `Already on ${LIST_NAME[to]}`); renderSheet();
+  },
+  "open-copy": () => openSheet({kind:"copy", sel:new Set(), tab:"all"}),
+  "copy-tab": el => { st.sheet.tab = el.dataset.v; renderSheet(); },
+  "copy-pick": el => { const s = st.sheet, id = el.dataset.id; if (s.sel.has(id)) s.sel.delete(id); else s.sel.add(id); renderSheet(); },
+  "copy-all": () => { const s = st.sheet; const ids = copyCandidates(s).map(x => x.id); const allOn = ids.every(i => s.sel.has(i)); ids.forEach(i => allOn ? s.sel.delete(i) : s.sel.add(i)); renderSheet(); },
+  "copy-go": () => {
+    const s = st.sheet; let n = 0;
+    [...s.sel].forEach(id => { const it = st.lists.mine[id]; if (it && copyItem(it, "ours")) n++; });
+    closeSheet(); st.list = "ours"; lsSet("wl.list","ours"); render(true);
+    toast(`Copied ${n} title${n===1?"":"s"} to Our list`);
+  },
   "move": (el,id) => {
     const from = listOf(id), to = from==="ours" ? "mine" : "ours";
     const it = clean(st.lists[from][id]);
