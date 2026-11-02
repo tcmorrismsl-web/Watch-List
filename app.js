@@ -139,11 +139,19 @@ function after(a, b){ return a.s > b.s || (a.s===b.s && a.e > b.e); }
 function airedLimit(it){
   if (it.type!=="tv") return null;
   const T = todayISO();
+  let lim = null;
   const aired = [it.lastAir, it.nextAir].filter(x => x && x.date && x.date <= T && x.s);
-  if (aired.length) return aired.sort((a,b) => b.s-a.s || b.e-a.e).map(x => ({s:x.s, e:x.e}))[0];
-  if (it.showStatus==="upcoming" || (it.firstAir && it.firstAir > T)) return {s:1, e:0};
-  return null;
+  if (aired.length) lim = aired.sort((a,b) => b.s-a.s || b.e-a.e).map(x => ({s:x.s, e:x.e}))[0];
+  else if (it.showStatus==="upcoming" || (it.firstAir && it.firstAir > T)) lim = {s:1, e:0};
+  const us = it.usSeasons;
+  if (us != null){
+    const S = it.seasons || [];
+    const usLim = us === 0 ? {s:1, e:0} : {s:us, e:S[us-1] || 0};
+    if (!lim || after(lim, usLim)) lim = usLim;
+  }
+  return lim;
 }
+function notInUS(it){ return it.type==="tv" && it.usSeasons != null && it.usSeasons < (it.seasons||[]).length; }
 function capProgress(p, it){ const L = airedLimit(it); return L && after(p, L) ? {s:L.s, e:L.e} : p; }
 function airedEps(it){
   const L = airedLimit(it); if (!L) return totalEps(it);
@@ -164,7 +172,10 @@ function outDate(it){
   const ds = it.type==="tv" ? [it.nextAir && it.nextAir.date, it.firstAir] : [it.releaseDate, it.digitalDate];
   return ds.filter(d => d && d > T).sort()[0] || "";
 }
-function notOutMsg(it){ const d = outDate(it); return `${it.title} isn't out yet${d ? ` (${relDay(d)})` : ""}, so it's on Up next`; }
+function notOutMsg(it){
+  if (it.type==="tv" && it.usSeasons===0) return `${it.title} isn't available in the US yet, so it's on Up next`;
+  const d = outDate(it); return `${it.title} isn't out yet${d ? ` (${relDay(d)})` : ""}, so it's on Up next`;
+}
 function nextEp(it){
   const n = rawNextEp(it); if (!n) return null;
   const L = airedLimit(it); return L && after(n, L) ? null : n;
@@ -283,7 +294,7 @@ function toMeta(type, d){
     lastAir: tv && d.last_episode_to_air ? {date:d.last_episode_to_air.air_date||"", s:d.last_episode_to_air.season_number, e:d.last_episode_to_air.episode_number} : null,
     firstAir: tv ? (d.first_air_date||"") : "",
     ...(tv ? {} : usDates(d)),
-    mv: 2
+    mv: 3
   };
 }
 function usDates(d){
@@ -295,7 +306,24 @@ function usDates(d){
 }
 async function details(type, id, fresh){
   const d = await tmdb(`/${type}/${id}`, {append_to_response: type==="movie" ? "watch/providers,credits,release_dates" : "watch/providers,credits"}, fresh);
-  return toMeta(type, d);
+  const m = toMeta(type, d);
+  if (type==="tv"){ m.origin = (d.origin_country||[]).includes("US") ? "US" : ((d.origin_country||[])[0] || ""); m.usSeasons = await usSeasonCount(d, m, fresh); }
+  return m;
+}
+// For shows made outside the US: how many seasons can be watched in the US (any US service, rent or buy included).
+// null = no limit (US show, or TMDB has no season-level data to go on). 0 = nothing available in the US.
+function hasUS(us){ return !!us && ["flatrate","free","ads","rent","buy"].some(k => (us[k]||[]).length); }
+async function usSeasonCount(d, m, fresh){
+  const origin = d.origin_country || [];
+  if (!origin.length || origin.includes("US") || !m.seasons.length) return null;
+  if (!hasUS((((d["watch/providers"]||{}).results)||{}).US)) return 0;
+  for (let n = m.seasons.length; n >= 1; n--){
+    try {
+      const r = await tmdb(`/tv/${d.id}/season/${n}/watch/providers`, {}, fresh);
+      if (hasUS((r.results||{}).US)) return n;
+    } catch(e){ if (e.code==="badkey" || e.code==="offline" || e.code==="nokey") throw e; return null; }
+  }
+  return null;
 }
 async function searchTitles(q){
   const d = await tmdb("/search/multi", {query:q, include_adult:"false", language:"en-US"});
@@ -315,6 +343,7 @@ function makeItem(m, status, L){
     runtimeMin:Math.round(+m.runtimeMin)||null, seasons: type==="tv" && Array.isArray(m.seasons) ? m.seasons.map(n=>Math.max(0,Math.round(+n||0))).slice(0,80) : [],
     poster:str(m.poster,120), nextAir:m.nextAir||null, lastAir:m.lastAir||null,
     firstAir:str(m.firstAir,10), releaseDate:str(m.releaseDate,10), digitalDate:str(m.digitalDate,10), mv:m.mv||1,
+    origin:str(m.origin,4), usSeasons: m.usSeasons==null ? null : m.usSeasons,
     status:"want", rating:null, progress:{s:1,e:0}, notes:"",
     addedAt:Date.now(), updatedAt:Date.now(), finishedAt:null, checkedAt: m.tmdbId ? Date.now() : null,
     addedBy: L==="ours" ? uid() : null
@@ -353,13 +382,14 @@ function mergeMeta(it, m){
   out.endYear = m.endYear || null;
   out.nextAir = m.nextAir || null;
   out.lastAir = m.lastAir || null;
+  if ("usSeasons" in m){ out.usSeasons = m.usSeasons==null ? null : m.usSeasons; out.origin = m.origin || ""; }
   ["firstAir","releaseDate","digitalDate"].forEach(k => { out[k] = m[k] || ""; });
   if (m.mv) out.mv = m.mv;
   if (!it.genresManual && m.genres && m.genres.length) out.genres = m.genres;
   if (!it.platformsManual) out.platforms = m.platforms || [];
   if (it.type==="tv" && m.seasons && m.seasons.length){
-    const before = totalEps(it); out.seasons = m.seasons;
-    if (before > 0 && totalEps(out) > before) out.newAt = Date.now();
+    const before = airedEps(it); out.seasons = m.seasons;
+    if (before > 0 && airedEps(out) > before && it.mv===3) out.newAt = Date.now();
   }
   out.checkedAt = Date.now();
   return out;
@@ -509,11 +539,11 @@ async function runRefresh(){
   ["mine","ours"].forEach(L => Object.values(st.lists[L]).forEach(x => {
     if (!x.tmdbId || refreshedThisVisit.has(x.id)) return;
     const active = x.type==="tv" && (x.status==="watching" || x.status==="want" || (x.status==="watched" && x.showStatus!=="ended"));
-    const stale = !x.checkedAt || x.mv !== 2 || Date.now() - x.checkedAt > (active ? 0.5 : 14) * DAY;
+    const stale = !x.checkedAt || x.mv !== 3 || Date.now() - x.checkedAt > (active ? 0.5 : 14) * DAY;
     if (stale) due.push([L, x.id]);
   }));
   if (!due.length) return;
-  due.sort((a,b) => (st.lists[a[0]][a[1]].mv===2) - (st.lists[b[0]][b[1]].mv===2));
+  due.sort((a,b) => (st.lists[a[0]][a[1]].mv===3) - (st.lists[b[0]][b[1]].mv===3));
   refreshing = true;
   try {
     await pool(due.slice(0,30), 3, async ([L,id]) => {
@@ -741,7 +771,14 @@ function ratingChip(it){
 function schedule(it){
   const T = todayISO();
   if (it.type==="tv"){
-    const nx = it.nextAir, la = it.lastAir;
+    const us = it.usSeasons;
+    if (us === 0) return {tone:"info", text:"Not available in the US yet"};
+    const inUS = x => x && (us == null || x.s <= us);
+    const nx = inUS(it.nextAir) ? it.nextAir : null, la = inUS(it.lastAir) ? it.lastAir : null;
+    if (notInUS(it)) {
+      if (nx && nx.date && nx.date > T) return {tone:"soon", text:`Next: ${code(nx.s,nx.e)} · ${relDay(nx.date)}`};
+      return {tone:"info", text:`Season ${us+1} isn't in the US yet`};
+    }
     if (it.showStatus==="upcoming" && (!it.firstAir || it.firstAir > T)){
       const d = (nx && nx.date) || it.firstAir;
       return d ? {tone:"soon", text:`Premieres ${relDay(d)}`} : {tone:"info", text:"Premiere date not announced"};
@@ -998,10 +1035,12 @@ function detailHTML(it, s, L){
   if (it.network) kv.push([it.type==="movie" ? "Studio" : "Network", it.network]);
   if (it.people) kv.push([it.type==="movie" ? "Credits" : "People", it.people]);
   if (it.type==="tv" && it.seasons.length) kv.push(["Episodes", `${totalEps(it)} across ${seasonsLabel(it).toLowerCase()} (${it.seasons.join(" / ")})`]);
+  if (notInUS(it)) kv.push(["In the US", it.usSeasons===0 ? "Not available yet" : `Season${it.usSeasons>1?"s":""} 1${it.usSeasons>1?`–${it.usSeasons}`:""} only. Season ${it.usSeasons+1} isn't on a US service yet.`]);
   if (it.runtimeMin) kv.push([it.type==="movie" ? "Runtime" : "Episode", fmtRun(it.runtimeMin)]);
   if (it.showStatus) kv.push(["Status", {returning:"Still airing",ended:"Ended",upcoming:"Coming soon",released:"Released"}[it.showStatus] || it.showStatus]);
-  if (it.nextAir && it.nextAir.date) kv.push(["Next", `${code(it.nextAir.s,it.nextAir.e)} on ${fmtDate(it.nextAir.date)}`]);
-  if (it.lastAir && it.lastAir.date) kv.push(["Last aired", `${code(it.lastAir.s,it.lastAir.e)} on ${fmtDate(it.lastAir.date)}`]);
+  const where = it.origin && it.origin!=="US" ? ` (${it.origin==="GB" ? "UK" : it.origin})` : "";
+  if (it.nextAir && it.nextAir.date) kv.push([`Next${where}`, `${code(it.nextAir.s,it.nextAir.e)} on ${fmtDate(it.nextAir.date)}`]);
+  if (it.lastAir && it.lastAir.date) kv.push([`Last aired${where}`, `${code(it.lastAir.s,it.lastAir.e)} on ${fmtDate(it.lastAir.date)}`]);
   if (it.type==="movie" && it.releaseDate) kv.push(["In theaters", fmtDate(it.releaseDate)]);
   if (it.type==="movie" && it.digitalDate) kv.push(["Streaming / digital", fmtDate(it.digitalDate)]);
   if (L==="ours" && it.addedBy && memberName(it.addedBy)) kv.push(["Added by", memberName(it.addedBy)]);
