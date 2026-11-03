@@ -598,6 +598,15 @@ function weight(x){
   if (x.status==="watching") return 1.6; if (x.status==="watched") return 1; return 0.6;
 }
 function verb(x){ return x.rating===2 ? "loved" : x.rating===1 ? "liked" : x.status==="watching" ? "are watching" : x.status==="want" ? "saved" : "watched"; }
+// TMDB genre ids for the app's categories, per type. Anime is Animation made in Japan.
+async function genreQuery(type, wanted){
+  const G = await genreNames();
+  const names = wanted.map(g => g==="Anime" ? "Animation" : g);
+  const ids = Object.entries(G[type]).filter(([,n]) => mapTmdbGenres([n], type, "").some(g => names.includes(g))).map(([id]) => id);
+  return ids.length ? {with_genres: ids.join("|")} : null;
+}
+function genresOfResult(r, type, G){ return mapTmdbGenres((r.genre_ids||[]).map(id => G[type][id]).filter(Boolean), type, r.original_language); }
+function matchesGenres(names, wanted){ return !wanted.length || names.some(g => wanted.includes(g)); }
 async function buildPicks(){
   const p = st.profile, nowY = new Date().getFullYear();
   const dis = new Set(p.dismissed||[]);
@@ -605,44 +614,76 @@ async function buildPicks(){
     .sort((a,b) => weight(b)-weight(a) || (b.updatedAt||0)-(a.updatedAt||0)).slice(0,10);
   const G = await genreNames();
   const cands = new Map();
-  const add = (r, type, score, because) => {
+  const wanted = p.genres || [];
+  const add = (r, type, score, because, label) => {
     if (!r || !r.id) return;
     const t = r.media_type==="tv" || r.media_type==="movie" ? r.media_type : type;
     if (t!=="tv" && t!=="movie") return;
     const k = t + ":" + r.id;
     if (inAnyList(t, r.id) || dis.has(k)) return;
     if (p.kind!=="both" && p.kind!==t) return;
-    let c = cands.get(k); if (!c){ c = {k, type:t, r, score:0, because:[]}; cands.set(k, c); }
+    if (!matchesGenres(genresOfResult(r, t, G), wanted)) return;
+    let c = cands.get(k); if (!c){ c = {k, type:t, r, score:0, because:[], label}; cands.set(k, c); }
     c.score += score; if (because && !c.because.includes(because)) c.because.push(because);
   };
+  // With genres chosen, also pull the best titles in those genres directly (on your services when you've picked some).
+  const svcNames = (p.services||[]).filter(x => !["Cable / live TV","Rent or buy","In theaters"].includes(x));
+  const svcIds = svcNames.length ? await providerIds(svcNames) : [];
+  async function discoverGenres(pages){
+    if (!wanted.length) return;
+    const kinds = p.kind==="both" ? ["tv","movie"] : [p.kind];
+    await pool(kinds, 2, async t => {
+      const gq = await genreQuery(t, wanted); if (!gq) return;
+      const base = {...gq, language:"en-US", "vote_count.gte": t==="tv" ? 15 : 60};
+      if (wanted.length===1 && wanted[0]==="Anime") base.with_original_language = "ja";
+      if (svcIds.length){ base.watch_region = "US"; base.with_watch_providers = svcIds.join("|"); base.with_watch_monetization_types = "flatrate|free|ads"; }
+      for (const sort of ["popularity.desc","vote_average.desc"]) for (const pg of pages){
+        try {
+          const d = await tmdb(`/discover/${t}`, {...base, sort_by:sort, page:pg});
+          (d.results||[]).forEach((r,i) => add({...r, media_type:t}, t, (sort==="popularity.desc" ? 0.9 : 0.7) * (1 - i/40), null, "genre"));
+        } catch(e){ if (e.code==="badkey") throw e; }
+      }
+    });
+  }
+  await discoverGenres([1]);
   if (seeds.length){
     const res = await pool(seeds, 4, async s => { try { return [s, await tmdb(`/${s.type}/${s.tmdbId}/recommendations`)]; } catch(e){ if (e.code==="badkey") throw e; return [s, null]; } });
     res.forEach(([s,d]) => ((d && d.results) || []).slice(0,20).forEach((r,i) => add(r, s.type, weight(s) * (1 - i/30), s)));
   }
-  if (cands.size < 14){
+  if (cands.size < 20) await discoverGenres([2,3]);
+  if (cands.size < 14 && !wanted.length){
     const t = await tmdb("/trending/all/week");
     (t.results||[]).forEach((r,i) => add(r, r.media_type, 0.5 * (1 - i/40), null));
   }
   for (const c of cands.values()){
-    const names = mapTmdbGenres((c.r.genre_ids||[]).map(id => G[c.type][id]).filter(Boolean), c.type, c.r.original_language);
-    c.score += names.filter(g => p.genres.includes(g)).length * 0.6;
+    const names = genresOfResult(c.r, c.type, G); c.names = names;
     const y = +((c.r.first_air_date||c.r.release_date||"").slice(0,4)) || 0;
     if (p.recent && y && y < nowY - 2) c.score *= 0.35;
     c.score += Math.min((c.r.vote_average||0)/10, 1) * 0.4;
     if ((c.r.vote_count||0) < 30) c.score *= 0.6;
   }
-  const top = [...cands.values()].sort((a,b) => b.score-a.score).slice(0,24);
+  const top = [...cands.values()].sort((a,b) => b.score-a.score).slice(0,30);
   await pool(top, 5, async c => { try { c.meta = await details(c.type, c.r.id); } catch(e){} });
-  let out = top.filter(c => c.meta && streamable(c.meta));
+  let out = top.filter(c => c.meta && streamable(c.meta) && matchesGenres(c.meta.genres||[], wanted));
   const svc = p.services || [];
   if (svc.length){
     out.forEach(c => { if (c.meta.platforms.some(x => svc.includes(x))) c.score += 1; });
     if (p.onlyMine) out = out.filter(c => c.meta.platforms.some(x => svc.includes(x)));
     out.sort((a,b) => b.score-a.score);
   }
+  // With several genres chosen, take turns so each one shows up.
+  if (wanted.length > 1){
+    const groups = wanted.map(g => out.filter(c => (c.meta.genres||[]).includes(g)));
+    const mixed = [], seen = new Set();
+    for (let i=0; mixed.length < out.length && i < out.length; i++) groups.forEach(gr => { const c = gr[i]; if (c && !seen.has(c.k)){ seen.add(c.k); mixed.push(c); } });
+    out = mixed;
+  }
   return out.slice(0,12).map(c => {
     const b = c.because.slice(0,2);
-    const why = b.length ? `Because you ${verb(b[0])} ${b[0].title}${b[1] ? ` and ${b[1].title}` : ""}` : "Popular this week";
+    const g = (c.meta.genres||[]).find(x => wanted.includes(x));
+    const on = svc.length ? (c.meta.platforms||[]).find(x => svc.includes(x)) : "";
+    const why = b.length ? `Because you ${verb(b[0])} ${b[0].title}${b[1] ? ` and ${b[1].title}` : ""}`
+      : g ? `Highly rated ${g.toLowerCase()}${on ? ` on ${on}` : ""}` : "Popular this week";
     return {...c.meta, why};
   });
 }
@@ -652,15 +693,30 @@ async function buildFresh(){
   const ids = await providerIds(svc); if (!ids.length) return [];
   const since = new Date(Date.now() - 150*DAY).toISOString().slice(0,10);
   const kinds = p.kind==="both" ? ["tv","movie"] : [p.kind];
-  const lists = await Promise.all(kinds.map(t => tmdb(`/discover/${t}`, {
-    watch_region:"US", with_watch_providers:ids.join("|"), with_watch_monetization_types:"flatrate|free|ads",
-    sort_by:"popularity.desc", [t==="tv" ? "first_air_date.gte" : "primary_release_date.gte"]:since, "vote_count.gte": t==="movie" ? 15 : 3, language:"en-US"
-  }).then(d => (d.results||[]).map(r => ({...r, media_type:t})))));
+  const wanted = p.genres || [];
+  const lists = await Promise.all(kinds.map(async t => {
+    const gq = wanted.length ? await genreQuery(t, wanted) : {};
+    if (!gq) return [];
+    const d = await tmdb(`/discover/${t}`, {...gq,
+      watch_region:"US", with_watch_providers:ids.join("|"), with_watch_monetization_types:"flatrate|free|ads",
+      sort_by:"popularity.desc", [t==="tv" ? "first_air_date.gte" : "primary_release_date.gte"]:since, "vote_count.gte": t==="movie" ? 15 : 3, language:"en-US"});
+    return (d.results||[]).map(r => ({...r, media_type:t}));
+  }));
   const merged = []; for (let i=0;i<20;i++) lists.forEach(l => { if (l[i]) merged.push(l[i]); });
   const dis = new Set(p.dismissed||[]);
   const pick = merged.filter(r => !inAnyList(r.media_type, r.id) && !dis.has(r.media_type + ":" + r.id)).slice(0,16);
   const metas = await pool(pick, 5, async r => { try { return await details(r.media_type, r.id); } catch(e){ return null; } });
-  return metas.filter(m => m && platsOf(m).some(x => svc.includes(x))).slice(0,10);
+  return metas.filter(m => m && platsOf(m).some(x => svc.includes(x)) && matchesGenres(m.genres||[], wanted)).slice(0,10);
+}
+let tasteTimer = null;
+function tasteChanged(){
+
+  clearTimeout(tasteTimer);
+  tasteTimer = setTimeout(() => {
+    if (st.tab!=="foryou") return;
+    if (st.picks[st.list] && !st.picksBusy) A.picks();
+    if ((st.profile.services||[]).length && st.fresh && !st.freshBusy) A.fresh();
+  }, 900);
 }
 function savePicksLocal(){ lsSet("wl.picks", JSON.stringify(st.picks)); }
 
@@ -917,7 +973,7 @@ function forYouHTML(){
     <div><h2 id="tasteH">Your taste</h2><p class="lede">Picks start from what you loved, liked and are watching${st.list==="ours" ? " on Our list" : ""}, then lean toward these.</p></div>
     <div><span class="lbl">Services you have</span><div class="chips">${SERVICE_CHOICES.map(s=>`<button class="chipbtn" data-action="service" data-s="${esc(s)}" aria-pressed="${p.services.includes(s)}"><i class="sw" style="--c:${PLAT_COLOR[s]}"></i>${esc(s)}</button>`).join("")}</div>
       ${p.services.length ? `<label class="check" for="onlyMine" style="margin-top:10px"><input type="checkbox" id="onlyMine" ${p.onlyMine?"checked":""}>Only pick things on my services</label>` : ""}</div>
-    <div><span class="lbl">Genres you reach for</span><div class="chips">${GENRES.map(g=>`<button class="chipbtn" data-action="genre" data-g="${esc(g)}" aria-pressed="${p.genres.includes(g)}">${esc(g)}</button>`).join("")}</div></div>
+    <div><span class="lbl">Only show these genres</span><p class="note" style="margin:-2px 0 8px">Leave them all off to see every genre.</p><div class="chips">${GENRES.map(g=>`<button class="chipbtn" data-action="genre" data-g="${esc(g)}" aria-pressed="${p.genres.includes(g)}">${esc(g)}</button>`).join("")}</div></div>
     <div class="row"><div class="seg" role="group" aria-label="Show me">${kinds.map(([k,l])=>`<button class="chipbtn" data-action="kind" data-k="${k}" aria-pressed="${p.kind===k}">${l}</button>`).join("")}</div>
     <label class="check" for="recent"><input type="checkbox" id="recent" ${p.recent?"checked":""}>Favor recent releases</label></div>
   </section>`;
@@ -1391,9 +1447,9 @@ const A = {
     } catch(e){ toast(tmdbErr(e)); }
     st.updBusy = false; render(true);
   },
-  "genre": el => { const g = el.dataset.g, a = st.profile.genres; st.profile.genres = a.includes(g) ? a.filter(x=>x!==g) : [...a,g]; backend.saveProfile(); render(true); },
-  "service": el => { const v = el.dataset.s, a = st.profile.services||[]; st.profile.services = a.includes(v) ? a.filter(x=>x!==v) : [...a,v]; st.fresh = null; backend.saveProfile(); render(true); },
-  "kind": el => { st.profile.kind = el.dataset.k; st.fresh = null; backend.saveProfile(); render(true); },
+  "genre": el => { const g = el.dataset.g, a = st.profile.genres; st.profile.genres = a.includes(g) ? a.filter(x=>x!==g) : [...a,g]; backend.saveProfile(); tasteChanged(); render(true); },
+  "service": el => { const v = el.dataset.s, a = st.profile.services||[]; st.profile.services = a.includes(v) ? a.filter(x=>x!==v) : [...a,v]; backend.saveProfile(); tasteChanged(); render(true); },
+  "kind": el => { st.profile.kind = el.dataset.k; backend.saveProfile(); tasteChanged(); render(true); },
   "cat": el => { st.cat = el.dataset.v; lsSet("wl.cat", st.cat); render(true); },
   "plat": el => { st.plat = el.dataset.v; lsSet("wl.plat", st.plat); render(true); },
   "picks": async () => {
@@ -1510,8 +1566,8 @@ document.addEventListener("change", e => {
   const t = e.target;
   if (t.id==="bCat" && st.sheet){ st.sheet.bcat = t.value; t.blur(); browse(st.sheet); return; }
   if (t.id==="bHide" && st.sheet){ st.sheet.bhide = t.checked; renderSheet(); return; }
-  if (t.id==="recent"){ st.profile.recent = t.checked; backend.saveProfile(); }
-  else if (t.id==="onlyMine"){ st.profile.onlyMine = t.checked; backend.saveProfile(); }
+  if (t.id==="recent"){ st.profile.recent = t.checked; backend.saveProfile(); tasteChanged(); }
+  else if (t.id==="onlyMine"){ st.profile.onlyMine = t.checked; backend.saveProfile(); tasteChanged(); }
   else if (t.id==="notes"){ const L = listOf(t.dataset.id), it = clean(st.lists[L][t.dataset.id]); if (it.notes !== t.value){ it.notes = t.value.slice(0,2000); upsert(it, L); } }
   else if (t.id==="pS" || t.id==="pE"){
     const L = listOf(t.dataset.id), it = clean(st.lists[L][t.dataset.id]);
