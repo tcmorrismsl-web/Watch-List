@@ -443,7 +443,7 @@ function stopAll(){ unsubs.forEach(f=>f()); hUnsubs.forEach(f=>f()); unsubs = []
 function startCloud(u){
   stopAll();
   st.user = {uid:u.uid, name: (u.displayName || (u.email||"").split("@")[0] || "Someone").split(" ")[0], email:u.email||""};
-  st.ready = false; st.lists = {mine:{}, ours:{}}; st.household = null;
+  st.ready = false; st.lists = {mine:{}, ours:{}}; st.household = null; mineLoaded = false; oursLoaded = false;
   backend = cloudBackend();
   const timer = setTimeout(() => { if (!st.ready){ st.ready = true; st.slow = true; render(); } }, 10000);
   unsubs.push(fs.doc(`users/${u.uid}`).onSnapshot(s => {
@@ -455,7 +455,7 @@ function startCloud(u){
   let imported = false;
   unsubs.push(fs.collection(`users/${u.uid}/items`).onSnapshot(snap => {
     st.lists.mine = toMap(snap); st.ready = true; st.slow = false; clearTimeout(timer);
-    if (!imported && !snap.metadata.fromCache){ imported = true; importLocal(u.uid); }
+    if (!imported && !snap.metadata.fromCache){ imported = true; importLocal(u.uid); mineLoaded = true; syncOursToMine(); }
     render(); scheduleRefresh();
   }, () => { st.ready = true; st.slow = true; render(); }));
 }
@@ -466,6 +466,32 @@ function copyItem(it, to){
   const c = clean(it); c.id = newId(); c.updatedAt = Date.now();
   c.addedBy = to==="ours" ? uid() : null;
   st.lists[to][c.id] = c; backend.saveItem(c, to); return c;
+}
+// Our list -> My list. Progress and Watching/Watched carry over, never moving My list backwards.
+// My own rating and notes stay mine; a shared rating only fills in an unrated title.
+// Titles started or finished on Our list are added to My list so they count in my history.
+let mineLoaded = false, oursLoaded = false;
+const STATUS_RANK = {want:0, watching:1, watched:2};
+function syncOursToMine(){
+  if (st.mode!=="cloud" || !st.household || !mineLoaded || !oursLoaded) return;
+  Object.values(st.lists.ours).forEach(o => {
+    if (!o || !(o.status in STATUS_RANK)) return;
+    const mine = findIn("mine", o);
+    if (!mine){
+      if (o.status==="want") return;
+      const c = clean(o); c.id = newId(); c.addedBy = null; c.notes = ""; c.fromOurs = true; c.updatedAt = Date.now();
+      st.lists.mine[c.id] = c; backend.saveItem(c, "mine"); return;
+    }
+    if (mine.status==="dropped") return;
+    const it = clean(mine); let changed = false;
+    if (o.type==="tv" && o.progress && (!it.progress || after(o.progress, it.progress))){ it.progress = {s:o.progress.s, e:o.progress.e}; changed = true; }
+    if ((STATUS_RANK[o.status]||0) > (STATUS_RANK[it.status]||0)){
+      it.status = o.status; if (o.status==="watched") it.finishedAt = o.finishedAt || Date.now(); changed = true;
+    }
+    if (it.rating==null && o.rating!=null){ it.rating = o.rating; changed = true; }
+    if (it.type==="tv" && it.status==="watched" && o.status==="watching" && nextEp(it)){ it.status = "watching"; changed = true; }
+    if (changed){ it.updatedAt = Date.now(); st.lists.mine[it.id] = it; backend.saveItem(it, "mine"); }
+  });
 }
 function importLocal(id){
   let d = null; try { d = JSON.parse(lsGet("wl.data")||"null"); } catch(e){}
@@ -483,7 +509,7 @@ function importLocal(id){
   if (n) toast(`Moved ${n} title${n>1?"s":""} from this phone into your account`);
 }
 function watchHousehold(hid){
-  hUnsubs.forEach(f=>f()); hUnsubs = []; st.lists.ours = {};
+  hUnsubs.forEach(f=>f()); hUnsubs = []; st.lists.ours = {}; oursLoaded = false;
   if (!hid){ st.household = null; if (st.list==="ours") render(true); return; }
   st.household = {id:hid, members:[], names:{}, tmdbKey:"", loading:true};
   hUnsubs.push(fs.doc(`households/${hid}`).onSnapshot(s => {
@@ -492,7 +518,7 @@ function watchHousehold(hid){
     render();
   }, () => { st.household = null; render(true); }));
   hUnsubs.push(fs.collection(`households/${hid}/items`).onSnapshot(snap => {
-    st.lists.ours = toMap(snap); render(); scheduleRefresh();
+    st.lists.ours = toMap(snap); oursLoaded = !snap.metadata.fromCache || oursLoaded; syncOursToMine(); render(); scheduleRefresh();
   }, () => {}));
 }
 
