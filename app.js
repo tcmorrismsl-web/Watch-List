@@ -32,7 +32,7 @@ const PROV_RULES = [
   [/^shudder/i,"Shudder"],[/^bet\s?(\+|plus)/i,"BET+"],[/^tubi/i,"Tubi"],[/^pluto/i,"Pluto TV"],[/^the roku channel|^roku channel/i,"Roku Channel"],
   [/^youtube tv|^fubo|^sling|^directv|^philo|^spectrum|^xfinity|^frndly/i,"Cable / live TV"],[/^youtube( premium| free)?$/i,"YouTube"]
 ];
-const TABS = [["watching","Watching"],["want","Up next"],["watched","Watched"],["foryou","For you"]];
+const TABS = [["watching","Watching"],["want","Up next"],["caught","Caught up"],["watched","Watched"],["foryou","For you"]];
 const RATINGS = [[2,"Loved"],[1,"Liked"],[0,"Meh"],[-1,"Not for me"]];
 const STATUS_LABEL = {want:"Up next",watching:"Watching",watched:"Watched",dropped:"Dropped"};
 const LIST_NAME = {mine:"My list", ours:"Our list"};
@@ -679,6 +679,24 @@ document.addEventListener("focusout", () => setTimeout(() => {
 
 function signedIn(){ return st.mode==="local" || (st.mode==="cloud" && !!st.user); }
 function oursBlocked(){ return st.list==="ours" && (!st.household || st.household.loading); }
+// Which tab a title belongs on, from where it actually stands rather than the last button tapped.
+//  watching: aired episodes left to watch     caught: mid-season, next episode scheduled
+//  want: queued, or a new season has a date    watched: done, or caught up with nothing announced
+function upcomingUS(x){
+  const nx = x.nextAir, us = x.usSeasons;
+  if (!nx || !nx.date || nx.date <= todayISO()) return null;
+  if (us != null && nx.s > us) return null;
+  return nx;
+}
+function place(x){
+  if (x.status==="want") return "want";
+  if (x.status==="dropped") return "watched";
+  if (x.type!=="tv" || !(x.seasons||[]).length) return x.status==="watching" ? "watching" : "watched";
+  if (nextEp(x)) return "watching";
+  const nx = upcomingUS(x);
+  if (nx) return nx.e===1 ? "want" : "caught";
+  return "watched";
+}
 function counts(L){
   const c = {want:0,watching:0,watched:0,dropped:0}; let min = 0;
   for (const it of Object.values(st.lists[L||st.list])){
@@ -701,14 +719,15 @@ function renderHeader(){
     return `<button data-action="list" data-l="${L}" aria-pressed="${st.list===L}">${LIST_NAME[L]}${n!=="" ? `<span class="n">${n}</span>` : ""}</button>`;
   }).join("");
   $("tabs").hidden = !ok;
-  const n = {watching:c.watching, want:c.want, watched:c.watched + c.dropped};
+  const n = {watching:0, want:0, caught:0, watched:0};
+  Object.values(st.items).forEach(x => { n[place(x)]++; });
   $("tabs").innerHTML = TABS.map(([k,l]) => `<button class="tab" role="tab" data-action="tab" data-tab="${k}" aria-selected="${st.tab===k}">${l}${n[k]!=null && st.ready && !oursBlocked() ? `<span class="n">${n[k]}</span>` : ""}</button>`).join("");
   $("fab").hidden = !ok || !st.ready || oursBlocked();
   $("filterbar").hidden = !ok || st.tab==="foryou" || !total || oursBlocked();
   $("filter").hidden = total < 8;
   renderFacets();
 }
-function inTab(x){ return st.tab==="watched" ? (x.status==="watched" || x.status==="dropped") : x.status===st.tab; }
+function inTab(x){ return place(x)===st.tab; }
 function renderFacets(){
   if ($("filterbar").hidden){ $("facets").innerHTML = ""; return; }
   const tabItems = Object.values(st.items).filter(inTab);
@@ -759,7 +778,7 @@ function renderMain(){
   const filt = "Nothing here matches those filters. Tap All or Anywhere to clear them.";
   if (st.tab==="watching"){
     const fresh = x => { const s = schedule(x); return s && s.tone==="new" ? 1 : 0; };
-    const arr = all.filter(x=>x.status==="watching").sort((a,b) => fresh(b)-fresh(a) || (b.newAt||0)-(a.newAt||0) || (b.updatedAt||0)-(a.updatedAt||0));
+    const arr = all.filter(x=>place(x)==="watching").sort((a,b) => fresh(b)-fresh(a) || (b.newAt||0)-(a.newAt||0) || (b.updatedAt||0)-(a.updatedAt||0));
     if (arr.length) html += list(arr);
     else if (none && st.list==="ours") html += emptyBlock("Our list is empty",
       "Everything here is shared with everyone who joined with your invite code: titles, progress, ratings and notes. Copy titles over from My list, or add new ones.",
@@ -770,11 +789,18 @@ function renderMain(){
     else html += emptyBlock("Nothing in progress", filtered ? filt : "Start something from Up next, or add a show you're partway through.",
       `<button class="btn" data-action="tab" data-tab="want">See Up next</button><button class="btn" data-action="open-add">Add a title</button>`);
   } else if (st.tab==="want"){
-    const arr = all.filter(x=>x.status==="want").sort((a,b)=>(b.addedAt||0)-(a.addedAt||0));
-    html += arr.length ? list(arr) : emptyBlock("Your queue is empty", filtered ? filt : "Add things you mean to get to, or let For you suggest a few.",
+    const q = all.filter(x=>place(x)==="want");
+    const queue = q.filter(x=>x.status==="want").sort((a,b)=>(b.addedAt||0)-(a.addedAt||0));
+    const seasons = q.filter(x=>x.status!=="want").sort((a,b)=>(upcomingUS(a).date).localeCompare(upcomingUS(b).date));
+    if (seasons.length) html += `<section><p class="sub">New seasons coming</p>${list(seasons)}</section>`;
+    if (queue.length) html += seasons.length ? `<section><p class="sub">Your queue</p>${list(queue)}</section>` : list(queue);
+    if (!q.length) html += emptyBlock("Your queue is empty", filtered ? filt : "Add things you mean to get to, or let For you suggest a few. Shows you've finished show up here when a new season gets a date.",
       `<button class="btn" data-action="tab" data-tab="foryou">Get picks</button><button class="btn" data-action="open-add">Add a title</button>`);
+  } else if (st.tab==="caught"){
+    const arr = all.filter(x=>place(x)==="caught").sort((a,b)=>(upcomingUS(a).date).localeCompare(upcomingUS(b).date));
+    html += arr.length ? list(arr) : emptyBlock("Nothing waiting on new episodes", filtered ? filt : "Shows you're caught up on land here while the season is still airing, in order of the next episode.", "");
   } else {
-    const arr = all.filter(x=>x.status==="watched").sort((a,b)=>(b.finishedAt||b.updatedAt||0)-(a.finishedAt||a.updatedAt||0));
+    const arr = all.filter(x=>place(x)==="watched" && x.status!=="dropped").sort((a,b)=>(b.finishedAt||b.updatedAt||0)-(a.finishedAt||a.updatedAt||0));
     const dr = all.filter(x=>x.status==="dropped").sort((a,b)=>(b.updatedAt||0)-(a.updatedAt||0));
     const unrated = arr.filter(x=>x.rating==null).length;
     if (arr.length){
@@ -841,7 +867,12 @@ function schedHTML(it){
 function cardHTML(it){
   let prog = "", acts = "";
   const isNew = it.newAt && Date.now() - it.newAt < 14*DAY && nextEp(it);
-  if (it.type==="tv" && it.status==="watching"){
+  const pl = place(it);
+  const caughtChip = `<span class="chip c-watched"><span class="dot"></span>Caught up</span>`;
+  const rated = RATINGS.find(q=>q[0]===it.rating);
+  if (it.type==="tv" && it.status!=="dropped" && (pl==="caught" || (pl==="want" && it.status!=="want"))){
+    acts = caughtChip + (rated ? `<span class="chip r-${rated[0]}">${rated[1]}</span>` : "");
+  } else if (it.type==="tv" && it.status!=="dropped" && pl==="watching"){
     const tot = airedEps(it), done = Math.min(watchedEps(it), tot || Infinity), n = nextEp(it);
     prog = `<div class="prog"><div class="bar"><i style="width:${tot ? Math.min(100, done/tot*100).toFixed(1) : 0}%"></i></div><span class="mono">${done}${tot ? " / " + tot : ""} eps</span></div>`;
     acts = n ? `${isNew ? `<span class="chip new">New episodes</span>` : ""}<button class="btn primary" data-action="next" data-id="${it.id}">Watched <span class="mono">${code(n.s,n.e)}</span></button>`
@@ -854,8 +885,8 @@ function cardHTML(it){
     if (!isOut(it)) acts = "";
     else if (it.type==="tv") acts = `<button class="btn" data-action="start" data-id="${it.id}">Start watching</button>${it.showStatus==="returning" ? `<button class="btn" data-action="caught-up" data-id="${it.id}">Caught up</button>` : ""}<button class="btn ghost" data-action="finish" data-id="${it.id}">Seen it</button>`;
     else acts = `<button class="btn" data-action="finish" data-id="${it.id}">Watched it</button>`;
-  } else if (it.status==="watched"){
-    acts = (isNew ? `<button class="btn ghost" data-action="start" data-id="${it.id}">New season · resume</button>` : "") + ratingChip(it);
+  } else if (it.status==="watched" || (it.status==="watching" && pl==="watched")){
+    acts = ratingChip(it);
   } else {
     acts = `<span class="chip c-dropped">Dropped${it.type==="tv" && watchedEps(it) ? ` at ${code(it.progress.s,it.progress.e)}` : ""}</span>`;
   }
