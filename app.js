@@ -136,12 +136,32 @@ function watchedEps(it){
 }
 function after(a, b){ return a.s > b.s || (a.s===b.s && a.e > b.e); }
 // Latest episode that has actually aired, or null when there's no air-date data (hand-added shows).
+// When an aired episode can actually be streamed in the US. Streaming originals and premium channels
+// (Netflix, Max/HBO, Apple TV, Starz…) stream the day they air. Broadcast and cable shows reach
+// Hulu, Peacock and the like the next day.
+const SAME_DAY = /netflix|hulu|prime video|amazon|apple tv|disney\+|\bmax\b|hbo|peacock|paramount\+|showtime|starz|amc\+|mgm\+|discovery\+|bet\+|britbox|acorn|shudder|crunchyroll|youtube|tubi|roku/i;
+function streamsSameDay(it){ return SAME_DAY.test(it.network || "") || platsOf(it).some(p => (it.network||"").toLowerCase().includes(p.toLowerCase())); }
+function availOn(date, it){
+  if (!date) return "";
+  if (streamsSameDay(it)) return date;
+  const d = new Date(date + "T12:00:00"); d.setDate(d.getDate() + 1); return ymd(d);
+}
+function prevEp(x, it){
+  if (x.e > 1) return {s:x.s, e:x.e-1};
+  if (x.s > 1){ const S = it.seasons||[]; return {s:x.s-1, e:S[x.s-2] || 0}; }
+  return {s:1, e:0};
+}
 function airedLimit(it){
   if (it.type!=="tv") return null;
   const T = todayISO();
   let lim = null;
-  const aired = [it.lastAir, it.nextAir].filter(x => x && x.date && x.date <= T && x.s);
-  if (aired.length) lim = aired.sort((a,b) => b.s-a.s || b.e-a.e).map(x => ({s:x.s, e:x.e}))[0];
+  const known = [it.lastAir, it.nextAir].filter(x => x && x.date && x.s && x.e);
+  const ready = known.filter(x => availOn(x.date, it) <= T);
+  if (ready.length) lim = ready.sort((a,b) => b.s-a.s || b.e-a.e).map(x => ({s:x.s, e:x.e}))[0];
+  else if (known.length){
+    // The latest episode isn't streamable yet: everything before it is.
+    const first = known.sort((a,b) => a.s-b.s || a.e-b.e)[0]; lim = prevEp(first, it);
+  }
   else if (it.showStatus==="upcoming" || (it.firstAir && it.firstAir > T)) lim = {s:1, e:0};
   const us = it.usSeasons;
   if (us != null){
@@ -377,6 +397,7 @@ function inAnyList(type, tmdbId){
 }
 function upsert(it, L){
   L = L || listOf(it.id);
+  if (it.type==="tv" && it.progress) it.progress = capProgress(it.progress, it);
   it.updatedAt = Date.now(); st.lists[L][it.id] = it; backend.saveItem(it, L); render(true);
 }
 function addFromMeta(m, status){
@@ -485,7 +506,7 @@ function syncOursToMine(){
     }
     if (mine.status==="dropped") return;
     const it = clean(mine); let changed = false;
-    if (o.type==="tv" && o.progress && (!it.progress || after(o.progress, it.progress))){ it.progress = {s:o.progress.s, e:o.progress.e}; changed = true; }
+    if (o.type==="tv" && o.progress && (!it.progress || after(o.progress, it.progress))){ it.progress = capProgress({s:o.progress.s, e:o.progress.e}, it); changed = it.progress.s!==mine.progress?.s || it.progress.e!==mine.progress?.e; }
     if (!it.paused && (STATUS_RANK[o.status]||0) > (STATUS_RANK[it.status]||0)){
       it.status = o.status; if (o.status==="watched") it.finishedAt = o.finishedAt || Date.now(); changed = true;
     }
@@ -926,8 +947,11 @@ function schedule(it){
       const d = (nx && nx.date) || it.firstAir;
       return d ? {tone:"soon", text:`Premieres ${relDay(d)}`} : {tone:"info", text:"Premiere date not announced"};
     }
+    if (la && la.date && availOn(la.date, it) > T) return {tone:"soon", text:`${code(la.s,la.e)} aired ${relDay(la.date)} · streams ${relDay(availOn(la.date, it))}`};
     if (nx && nx.date){
-      if (nx.date <= T) return {tone:"new", text:`${code(nx.s,nx.e)} out ${relDay(nx.date)==="today" ? "today" : "now"}`};
+      const av = availOn(nx.date, it);
+      if (av <= T) return {tone:"new", text:`${code(nx.s,nx.e)} out ${relDay(av)==="today" ? "today" : "now"}`};
+      if (nx.date <= T) return {tone:"soon", text:`${code(nx.s,nx.e)} airs ${relDay(nx.date)} · streams ${relDay(av)}`};
       if (nx.e===1) return {tone:"soon", text:`Season ${nx.s} premieres ${relDay(nx.date)}`};
       return {tone:"soon", text:`Next: ${code(nx.s,nx.e)} · ${relDay(nx.date)}`};
     }
