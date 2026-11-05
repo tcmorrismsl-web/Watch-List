@@ -359,6 +359,7 @@ function makeItem(m, status, L){
 function applyStatus(it, status){
   if ((status==="watched" || status==="watching") && !isOut(it)) status = "want";
   it.status = status;
+  if (status!=="want"){ delete it.paused; delete it.pausedAt; }
   if (!it.progress) it.progress = {s:1,e:0};
   if (status==="watched"){
     it.finishedAt = Date.now();
@@ -485,11 +486,11 @@ function syncOursToMine(){
     if (mine.status==="dropped") return;
     const it = clean(mine); let changed = false;
     if (o.type==="tv" && o.progress && (!it.progress || after(o.progress, it.progress))){ it.progress = {s:o.progress.s, e:o.progress.e}; changed = true; }
-    if ((STATUS_RANK[o.status]||0) > (STATUS_RANK[it.status]||0)){
+    if (!it.paused && (STATUS_RANK[o.status]||0) > (STATUS_RANK[it.status]||0)){
       it.status = o.status; if (o.status==="watched") it.finishedAt = o.finishedAt || Date.now(); changed = true;
     }
     if (it.rating==null && o.rating!=null){ it.rating = o.rating; changed = true; }
-    if (it.type==="tv" && it.status==="watched" && o.status==="watching" && nextEp(it)){ it.status = "watching"; changed = true; }
+    if (!it.paused && it.type==="tv" && it.status==="watched" && o.status==="watching" && nextEp(it)){ it.status = "watching"; changed = true; }
     if (changed){ it.updatedAt = Date.now(); st.lists.mine[it.id] = it; backend.saveItem(it, "mine"); }
   });
 }
@@ -872,10 +873,12 @@ function renderMain(){
       `<button class="btn" data-action="tab" data-tab="want">See Up next</button><button class="btn" data-action="open-add">Add a title</button>`);
   } else if (st.tab==="want"){
     const q = all.filter(x=>place(x)==="want");
-    const queue = q.filter(x=>x.status==="want").sort((a,b)=>(b.addedAt||0)-(a.addedAt||0));
+    const paused = q.filter(x=>x.status==="want" && x.paused).sort((a,b)=>(b.pausedAt||0)-(a.pausedAt||0));
+    const queue = q.filter(x=>x.status==="want" && !x.paused).sort((a,b)=>(b.addedAt||0)-(a.addedAt||0));
+    if (paused.length) html += `<section><p class="sub">Paused</p>${list(paused)}</section>`;
     const seasons = q.filter(x=>x.status!=="want").sort((a,b)=>(upcomingUS(a).date).localeCompare(upcomingUS(b).date));
     if (seasons.length) html += `<section><p class="sub">New seasons coming</p>${list(seasons)}</section>`;
-    if (queue.length) html += seasons.length ? `<section><p class="sub">Your queue</p>${list(queue)}</section>` : list(queue);
+    if (queue.length) html += seasons.length || paused.length ? `<section><p class="sub">Your queue</p>${list(queue)}</section>` : list(queue);
     if (!q.length) html += emptyBlock("Your queue is empty", filtered ? filt : "Add things you mean to get to, or let For you suggest a few. Shows you've finished show up here when a new season gets a date.",
       `<button class="btn" data-action="tab" data-tab="foryou">Get picks</button><button class="btn" data-action="open-add">Add a title</button>`);
   } else if (st.tab==="caught"){
@@ -961,8 +964,12 @@ function cardHTML(it){
              : `<span class="chip c-watched"><span class="dot"></span>Caught up</span>`;
     if (n) acts += `<button class="btn" data-action="caught-up" data-id="${it.id}">Caught up</button>`;
     acts += `<button class="btn ghost" data-action="finish" data-id="${it.id}">Finished</button>`;
+    acts += `<button class="btn ghost" data-action="stash" data-id="${it.id}">Pause</button>`;
   } else if (it.status==="watching"){
-    acts = `<button class="btn primary" data-action="finish" data-id="${it.id}">Finished it</button>`;
+    acts = `<button class="btn primary" data-action="finish" data-id="${it.id}">Finished it</button><button class="btn ghost" data-action="stash" data-id="${it.id}">Pause</button>`;
+  } else if (it.status==="want" && it.paused){
+    const at = it.type==="tv" && it.progress && it.progress.e ? ` at ${code(it.progress.s, it.progress.e)}` : "";
+    acts = `<span class="chip">Paused${at}</span><button class="btn primary" data-action="resume" data-id="${it.id}">Resume watching</button>`;
   } else if (it.status==="want"){
     if (!isOut(it)) acts = "";
     else if (it.type==="tv") acts = `<button class="btn" data-action="start" data-id="${it.id}">Start watching</button>${it.showStatus==="returning" ? `<button class="btn" data-action="caught-up" data-id="${it.id}">Caught up</button>` : ""}<button class="btn ghost" data-action="finish" data-id="${it.id}">Seen it</button>`;
@@ -1335,6 +1342,16 @@ const A = {
   "b-more": () => browse(st.sheet, true),
   "open": (el,id) => openSheet({kind:"detail", id}),
   "next": (el,id) => markNext(id),
+  "stash": (el,id) => {
+    const L = listOf(id), it = clean(st.lists[L][id]);
+    it.status = "want"; it.paused = true; it.pausedAt = Date.now(); upsert(it, L);
+    toast(`Paused ${it.title}. It's in Up next until you resume it.`);
+  },
+  "resume": (el,id) => {
+    const L = listOf(id), it = clean(st.lists[L][id]);
+    if (applyStatus(it,"watching")!=="watching"){ toast(notOutMsg(it)); return; }
+    upsert(it, L); toast(`Back to watching ${it.title}`);
+  },
   "start": (el,id) => { const L = listOf(id), it = clean(st.lists[L][id]); if (applyStatus(it,"watching")!=="watching"){ toast(notOutMsg(it)); return; } upsert(it, L); toast(`Started ${it.title}`); },
   "finish": (el,id) => { const L = listOf(id), it = clean(st.lists[L][id]); if (applyStatus(it,"watched")!=="watched"){ toast(notOutMsg(it)); return; } delete it.newAt; upsert(it, L); if (it.rating==null) askRating(it); else toast(`Marked ${it.title} watched`); },
   "caught-up": (el,id) => {
