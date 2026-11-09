@@ -636,32 +636,56 @@ async function emailAuth(create){
 
 /* ---------- background refresh of shows ---------- */
 let refreshTimer = null, refreshing = false; const refreshedThisVisit = new Set();
-function scheduleRefresh(){ clearTimeout(refreshTimer); refreshTimer = setTimeout(runRefresh, 2500); }
+// When each title was last checked against TMDB, kept on this device so an unchanged title is never re-saved.
+let checkedLocal = {}; try { checkedLocal = JSON.parse(lsGet("wl.checked")||"{}") || {}; } catch(e){}
+function markChecked(id){ checkedLocal[id] = Date.now(); }
+function saveChecked(){ const cut = Date.now() - 30*DAY; Object.keys(checkedLocal).forEach(k => { if (checkedLocal[k] < cut) delete checkedLocal[k]; }); lsSet("wl.checked", JSON.stringify(checkedLocal)); }
+// Start a few seconds after the app opens, once it's idle, so it never competes with showing your list.
+function scheduleRefresh(){
+  clearTimeout(refreshTimer);
+  refreshTimer = setTimeout(() => {
+    if (document.visibilityState !== "visible") return;
+    (window.requestIdleCallback || (f => setTimeout(f, 0)))(runRefresh, {timeout: 3000});
+  }, 6000);
+}
+const IGNORE = new Set(["checkedAt","updatedAt"]);
+function sameData(a, b){
+  const ka = Object.keys(a).filter(k => !IGNORE.has(k)), kb = Object.keys(b).filter(k => !IGNORE.has(k));
+  if (ka.length !== kb.length) return false;
+  return ka.every(k => JSON.stringify(a[k]) === JSON.stringify(b[k]));
+}
 async function runRefresh(){
   if (refreshing || !tmdbKey()) return;
   const due = [];
   ["mine","ours"].forEach(L => Object.values(st.lists[L]).forEach(x => {
     if (!x.tmdbId || refreshedThisVisit.has(x.id)) return;
     const active = x.type==="tv" && (x.status==="watching" || x.status==="want" || (x.status==="watched" && x.showStatus!=="ended"));
-    const stale = !x.checkedAt || x.mv !== 3 || Date.now() - x.checkedAt > (active ? 0.5 : 14) * DAY;
+    const last = Math.max(x.checkedAt || 0, checkedLocal[x.id] || 0);
+    const stale = !last || x.mv !== 3 || Date.now() - last > (active ? 0.5 : 14) * DAY;
     if (stale) due.push([L, x.id]);
   }));
   if (!due.length) return;
   due.sort((a,b) => (st.lists[a[0]][a[1]].mv===3) - (st.lists[b[0]][b[1]].mv===3));
   refreshing = true;
+  const fetched = new Map(); // one TMDB lookup per show, even when it's on both lists
+  let changed = 0;
   try {
     await pool(due.slice(0,30), 3, async ([L,id]) => {
       refreshedThisVisit.add(id);
       const cur = st.lists[L][id]; if (!cur) return;
       try {
-        const m = await details(cur.type, cur.tmdbId, true);
+        const k = cur.type + ":" + cur.tmdbId;
+        if (!fetched.has(k)) fetched.set(k, details(cur.type, cur.tmdbId, true));
+        const m = await fetched.get(k);
         const now = st.lists[L][id]; if (!now) return;
         const merged = mergeMeta(now, m); merged.updatedAt = now.updatedAt;
-        st.lists[L][id] = merged; backend.saveItem(merged, L);
+        markChecked(id);
+        if (sameData(merged, now) && now.mv === merged.mv) return; // nothing new: no save, no redraw
+        merged.checkedAt = Date.now(); st.lists[L][id] = merged; backend.saveItem(merged, L); changed++;
       } catch(e){ if (e.code==="badkey" || e.code==="nokey") throw e; }
     });
   } catch(e){}
-  refreshing = false; render();
+  refreshing = false; saveChecked(); if (changed) render();
 }
 
 /* ---------- picks ---------- */
