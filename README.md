@@ -18,12 +18,17 @@ Track the TV shows and movies you're watching, share a list with someone, and se
 
 ## How it's built
 
-Plain HTML, CSS and JavaScript. No build step; GitHub Pages serves the files as they are.
+Plain HTML, CSS and JavaScript served as-is by GitHub Pages. The only build step is `build.sh`, which bundles Firebase into `fb.js` and only needs rerunning when Firebase is upgraded.
+
+**Why it opens fast:** the signed-in view is saved on the phone and shown immediately; Firebase loads after the first paint and catches up in the background. `sw.js` caches the app files and fonts so nothing waits on the network, and sign-in starts without Firebase's redirect helper (it loads a hidden page from firebaseapp.com, which is slow on iPhones) unless a Google redirect sign-in is in progress.
 
 | File | What it is |
 | --- | --- |
 | `index.html` | Page layout and styles |
-| `app.js` | All app logic |
+| `app.js` | All app logic. `APP_VERSION` must match `version.txt` |
+| `fb.js` | Firebase, bundled from `src/firebase-entry.js` by `build.sh` |
+| `sw.js` | Offline cache: the app opens from the phone, then refreshes in the background |
+| `version.txt` | Bump on every release; open apps reload themselves when it changes |
 | `config.js` | Your Firebase settings (and optionally a TMDB key) |
 | `firestore.rules` | Database security rules to paste into Firebase |
 | `manifest.webmanifest`, `icon-*.png` | Home-screen app icon and name |

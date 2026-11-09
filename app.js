@@ -7,7 +7,8 @@
 /* ---------- constants ---------- */
 const CFG = window.WATCHLIST_CONFIG || {};
 const FB_CFG = CFG.firebase || {};
-const HAS_FB = !!(window.firebase && FB_CFG.apiKey && FB_CFG.projectId && FB_CFG.authDomain);
+const HAS_FB = !!(FB_CFG.apiKey && FB_CFG.projectId && FB_CFG.authDomain);
+const APP_VERSION = "19"; // keep in sync with version.txt
 const TMDB = "https://api.themoviedb.org/3";
 const IMG = "https://image.tmdb.org/t/p/";
 
@@ -438,7 +439,9 @@ function markNext(id){
 }
 
 /* ---------- storage backends ---------- */
-let backend = null, fs = null, auth = null;
+let backend = null, fs = null, auth = null, FBX = null;
+let fbReady = null; // resolves once fb.js has loaded and Firebase is started
+const whenFB = fn => (fbReady || Promise.reject(new Error("no firebase"))).then(fn);
 function onWriteErr(e){
   const c = e && e.code;
   toast(c==="permission-denied" ? "You don't have access to change that list." : "Couldn't save that change. It will retry when you're back online.");
@@ -451,35 +454,53 @@ function localBackend(){
   return {saveItem:persist, deleteItem:persist, saveProfile:persist, saveUser:()=>{}};
 }
 function cloudBackend(){
-  const col = L => L==="ours" ? fs.collection(`households/${st.household.id}/items`) : fs.collection(`users/${uid()}/items`);
+  const col = (L, hid) => L==="ours" ? fs.collection(`households/${hid}/items`) : fs.collection(`users/${uid()}/items`);
   return {
-    saveItem(it, L){ L = L || st.list; if (L==="ours" && !st.household) return; col(L).doc(it.id).set(clean(it)).catch(onWriteErr); },
-    deleteItem(id, L){ L = L || st.list; if (L==="ours" && !st.household) return; col(L).doc(id).delete().catch(onWriteErr); },
-    saveProfile(){ fs.doc(`users/${uid()}`).set({profile:clean(st.profile)}, {merge:true}).catch(onWriteErr); },
-    saveUser(data){ return fs.doc(`users/${uid()}`).set(data, {merge:true}); }
+    saveItem(it, L){ L = L || st.list; if (L==="ours" && !st.household) return; const hid = st.household && st.household.id, data = clean(it); whenFB(() => col(L, hid).doc(data.id).set(data)).catch(onWriteErr); saveSnapSoon(); },
+    deleteItem(id, L){ L = L || st.list; if (L==="ours" && !st.household) return; const hid = st.household && st.household.id; whenFB(() => col(L, hid).doc(id).delete()).catch(onWriteErr); saveSnapSoon(); },
+    saveProfile(){ const data = {profile:clean(st.profile)}; whenFB(() => fs.doc(`users/${uid()}`).set(data, {merge:true})).catch(onWriteErr); saveSnapSoon(); },
+    saveUser(data){ return whenFB(() => fs.doc(`users/${uid()}`).set(data, {merge:true})); }
   };
 }
+// A copy of the signed-in view kept on the phone, so the list shows the instant the app opens.
+// Firebase then catches it up in the background.
+const SNAP_KEY = "wl.snap";
+let snapTimer = null;
+function saveSnapSoon(){ clearTimeout(snapTimer); snapTimer = setTimeout(saveSnap, 800); }
+function saveSnap(){
+  if (st.mode!=="cloud" || !st.user) return;
+  const hh = st.household && !st.household.loading ? st.household : null;
+  try { localStorage.setItem(SNAP_KEY, JSON.stringify({v:1, at:Date.now(), user:st.user, household:hh, userDoc:{household:st.userDoc.household||null},
+    profile:st.profile, lists:{mine:st.lists.mine, ours: hh ? st.lists.ours : {}}})); }
+  catch(e){ try { localStorage.removeItem(SNAP_KEY); } catch(e2){} }
+}
+function readSnap(){ try { const d = JSON.parse(localStorage.getItem(SNAP_KEY)||"null"); return d && d.v===1 && d.user && d.user.uid ? d : null; } catch(e){ return null; } }
+function clearSnap(){ clearTimeout(snapTimer); lsSet(SNAP_KEY, null); }
 function toMap(snap){ const m = {}; snap.forEach(d => { m[d.id] = {...d.data(), id:d.id}; }); return m; }
 let unsubs = [], hUnsubs = [];
 function stopAll(){ unsubs.forEach(f=>f()); hUnsubs.forEach(f=>f()); unsubs = []; hUnsubs = []; }
+let hWatching = undefined;
 function startCloud(u){
-  stopAll();
+  stopAll(); hWatching = undefined;
+  const same = st.user && st.user.uid===u.uid && st.ready;
   st.user = {uid:u.uid, name: (u.displayName || (u.email||"").split("@")[0] || "Someone").split(" ")[0], email:u.email||""};
-  st.ready = false; st.lists = {mine:{}, ours:{}}; st.household = null; mineLoaded = false; oursLoaded = false;
+  if (!same){ st.ready = false; st.lists = {mine:{}, ours:{}}; st.household = null; }
+  mineLoaded = false; oursLoaded = false;
   backend = cloudBackend();
   const timer = setTimeout(() => { if (!st.ready){ st.ready = true; st.slow = true; render(); } }, 10000);
   unsubs.push(fs.doc(`users/${u.uid}`).onSnapshot(s => {
     const d = s.data() || {}; st.userDoc = d; st.profile = {...DEF_PROFILE, ...(d.profile||{})};
     const hid = d.household || null;
-    if (hid !== (st.household ? st.household.id : null)) watchHousehold(hid);
-    render();
+    if (hid !== hWatching) watchHousehold(hid);
+    saveSnapSoon(); render();
   }, () => {}));
   let imported = false;
   unsubs.push(fs.collection(`users/${u.uid}/items`).onSnapshot(snap => {
+    if (snap.metadata.fromCache && !snap.size && st.ready && Object.keys(st.lists.mine).length) return; // keep the saved view until real data arrives
     st.lists.mine = toMap(snap); st.ready = true; st.slow = false; clearTimeout(timer);
     if (!imported && !snap.metadata.fromCache){ imported = true; importLocal(u.uid); mineLoaded = true; syncOursToMine(); }
-    render(); scheduleRefresh();
-  }, () => { st.ready = true; st.slow = true; render(); }));
+    saveSnapSoon(); render(); scheduleRefresh();
+  }, () => { st.ready = true; st.slow = true; render(); }, {includeMetadataChanges:true}));
 }
 // Titles saved on this device before signing in move into the account once, skipping any already there.
 // Copy a title into the other list as its own record (progress, rating and notes come along).
@@ -531,17 +552,19 @@ function importLocal(id){
   if (n) toast(`Moved ${n} title${n>1?"s":""} from this phone into your account`);
 }
 function watchHousehold(hid){
-  hUnsubs.forEach(f=>f()); hUnsubs = []; st.lists.ours = {}; oursLoaded = false;
-  if (!hid){ st.household = null; if (st.list==="ours") render(true); return; }
-  st.household = {id:hid, members:[], names:{}, tmdbKey:"", loading:true};
+  hUnsubs.forEach(f=>f()); hUnsubs = []; oursLoaded = false; hWatching = hid;
+  if (!hid){ st.household = null; st.lists.ours = {}; saveSnapSoon(); if (st.list==="ours") render(true); return; }
+  const keep = st.household && st.household.id===hid && !st.household.loading;
+  if (!keep){ st.lists.ours = {}; st.household = {id:hid, members:[], names:{}, tmdbKey:"", loading:true}; }
   hUnsubs.push(fs.doc(`households/${hid}`).onSnapshot(s => {
-    if (!s.exists){ st.household = null; render(true); return; }
+    if (!s.exists){ st.household = null; st.lists.ours = {}; saveSnapSoon(); render(true); return; }
     const d = s.data(); st.household = {id:hid, members:d.members||[], names:d.names||{}, tmdbKey:d.tmdbKey||"", loading:false};
-    render();
+    saveSnapSoon(); render();
   }, () => { st.household = null; render(true); }));
   hUnsubs.push(fs.collection(`households/${hid}/items`).onSnapshot(snap => {
-    st.lists.ours = toMap(snap); oursLoaded = !snap.metadata.fromCache || oursLoaded; syncOursToMine(); render(); scheduleRefresh();
-  }, () => {}));
+    if (snap.metadata.fromCache && !snap.size && Object.keys(st.lists.ours).length) return;
+    st.lists.ours = toMap(snap); oursLoaded = !snap.metadata.fromCache || oursLoaded; syncOursToMine(); saveSnapSoon(); render(); scheduleRefresh();
+  }, () => {}, {includeMetadataChanges:true}));
 }
 
 /* ---------- sharing ---------- */
@@ -551,18 +574,18 @@ function fmtCode(c){ return c ? c.slice(0,5) + "-" + c.slice(5) : ""; }
 function normCode(c){ return String(c||"").toUpperCase().replace(/[^A-Z0-9]/g,""); }
 async function createHousehold(){
   const hid = newCode();
-  await fs.doc(`households/${hid}`).set({members:[uid()], names:{[uid()]:st.user.name}, tmdbKey:tmdbKey(), createdAt:Date.now()});
+  await whenFB(() => fs.doc(`households/${hid}`).set({members:[uid()], names:{[uid()]:st.user.name}, tmdbKey:tmdbKey(), createdAt:Date.now()}));
   await backend.saveUser({household:hid});
 }
 async function joinHousehold(raw){
   const hid = normCode(raw);
   if (hid.length !== 10) throw {code:"badcode"};
-  await fs.doc(`households/${hid}`).update({members:firebase.firestore.FieldValue.arrayUnion(uid()), [`names.${uid()}`]:st.user.name});
+  await whenFB(() => fs.doc(`households/${hid}`).update({members:FBX.FieldValue.arrayUnion(uid()), [`names.${uid()}`]:st.user.name}));
   await backend.saveUser({household:hid});
 }
 async function leaveHousehold(){
   const hid = st.household && st.household.id; if (!hid) return;
-  try { await fs.doc(`households/${hid}`).update({members:firebase.firestore.FieldValue.arrayRemove(uid()), [`names.${uid()}`]:firebase.firestore.FieldValue.delete()}); } catch(e){}
+  try { await whenFB(() => fs.doc(`households/${hid}`).update({members:FBX.FieldValue.arrayRemove(uid()), [`names.${uid()}`]:FBX.FieldValue.delete()})); } catch(e){}
   await backend.saveUser({household:null});
 }
 function hhErrCopy(e){
@@ -592,11 +615,12 @@ function authCopy(e){
   return "Sign-in didn't work. Try again.";
 }
 async function googleSignIn(){
-  const p = new firebase.auth.GoogleAuthProvider();
+  await fbReady;
+  const p = new FBX.GoogleAuthProvider();
   st.authErr = ""; st.authBusy = true; render(true);
   try { await auth.signInWithPopup(p); }
   catch(e){
-    if (["auth/popup-blocked","auth/operation-not-supported-in-this-environment"].includes(e.code)){ try { await auth.signInWithRedirect(p); return; } catch(e2){ e = e2; } }
+    if (["auth/popup-blocked","auth/operation-not-supported-in-this-environment"].includes(e.code)){ try { lsSet("wl.redirect","1"); await auth.signInWithRedirect(p); return; } catch(e2){ lsSet("wl.redirect",null); e = e2; } }
     st.authErr = authCopy(e);
   }
   st.authBusy = false; render(true);
@@ -605,7 +629,7 @@ async function emailAuth(create){
   const email = ($("authEmail")||{}).value || "", pw = ($("authPw")||{}).value || "";
   if (!email.trim() || !pw){ st.authErr = "Enter your email and a password."; render(true); return; }
   st.authErr = ""; st.authBusy = true; render(true);
-  try { if (create) await auth.createUserWithEmailAndPassword(email.trim(), pw); else await auth.signInWithEmailAndPassword(email.trim(), pw); }
+  try { await fbReady; if (create) await auth.createUserWithEmailAndPassword(email.trim(), pw); else await auth.signInWithEmailAndPassword(email.trim(), pw); }
   catch(e){ st.authErr = authCopy(e); }
   st.authBusy = false; render(true);
 }
@@ -771,7 +795,12 @@ function savePicksLocal(){ lsSet("wl.picks", JSON.stringify(st.picks)); }
 /* ---------- rendering ---------- */
 let pendingMain = false, pendingSheet = false;
 function typingIn(root){ const a = document.activeElement; return !!a && root.contains(a) && /^(INPUT|TEXTAREA|SELECT)$/.test(a.tagName); }
+let renderQueued = false;
 function render(force){
+  if (force){ doRender(true); return; }
+  if (!renderQueued){ renderQueued = true; requestAnimationFrame(() => { renderQueued = false; doRender(false); }); }
+}
+function doRender(force){
   renderHeader();
   if (!force && typingIn(main)) pendingMain = true; else { pendingMain = false; renderMain(); }
   if (st.sheet){ if (!force && typingIn(sheet)) pendingSheet = true; else { pendingSheet = false; renderSheet(); } }
@@ -1545,7 +1574,7 @@ const A = {
   "email-create": () => emailAuth(true),
   "go-local": () => { lsSet("wl.local","1"); startLocal(); },
   "go-cloud": () => { lsSet("wl.local", null); location.reload(); },
-  "sign-out": async () => { closeSheet(); stopAll(); await auth.signOut(); },
+  "sign-out": async () => { closeSheet(); stopAll(); clearSnap(); await whenFB(() => auth.signOut()).catch(()=>{}); },
   "hh-create": async () => {
     st.hhBusy = true; st.hhErr = ""; render(true);
     try { await createHousehold(); st.list = "ours"; lsSet("wl.list","ours"); toast("Shared list started. Send your invite code from Settings."); }
@@ -1616,7 +1645,7 @@ document.addEventListener("submit", async e => {
       s.keyMsg = "Saved. TMDB is connected."; s.keyOk = true;
       if (st.mode==="cloud" && st.user){
         backend.saveUser({tmdbKey:v}).catch(()=>{});
-        if (st.household) fs.doc(`households/${st.household.id}`).update({tmdbKey:v}).catch(()=>{});
+        if (st.household){ const hid = st.household.id; whenFB(() => fs.doc(`households/${hid}`).update({tmdbKey:v})).catch(()=>{}); }
       }
       scheduleRefresh();
     } catch(err){ lsSet("wl.tmdb", old); s.keyMsg = tmdbErr(err); s.keyOk = false; }
@@ -1650,13 +1679,25 @@ document.addEventListener("change", e => {
 // When a newer version is published: reload on its own when you come back to the app,
 // or offer a Reload button if you're in the middle of using it.
 let updateShown = false;
+const SHELL_CACHE = "wl-shell";
+const SHELL_FILES = ["./", "index.html", "app.js", "fb.js", "config.js", "manifest.webmanifest"];
+async function refreshShell(){
+  if (!("caches" in window)) return;
+  try {
+    const c = await caches.open(SHELL_CACHE);
+    await Promise.all(SHELL_FILES.map(u => fetch(u, {cache:"no-cache"}).then(r => r.ok ? c.put(u, r) : null)));
+  } catch(e){}
+}
+async function reloadApp(){ saveSnap(); await refreshShell(); location.reload(); }
 async function checkForUpdate(fromResume){
-  const cur = window.WL_VERSION; if (!cur) return;
+  const cur = APP_VERSION; if (!cur || cur.startsWith("__")) return;
   let v = "";
   try { const r = await fetch("version.txt?" + Date.now(), {cache:"no-store"}); if (r.ok) v = (await r.text()).trim(); } catch(e){ return; }
   if (!v || v === cur) return;
   const busy = st.sheet || typingIn(document.body) || st.picksBusy || st.fillBusy || st.updBusy;
-  if (fromResume && !busy){ location.reload(); return; }
+  const tried = lsGet("wl.reloadedFor") === v; // already reloaded once for this version: don't loop
+  if (fromResume && !busy && !tried){ lsSet("wl.reloadedFor", v); reloadApp(); return; }
+  if (tried) return;
   if (updateShown) return; updateShown = true;
   const t = $("toast"); clearTimeout(toastTimer);
   t.innerHTML = `New version ready <button class="btn" style="margin-left:10px;min-height:30px;padding:6px 10px" data-action="reload-app">Reload</button>`;
@@ -1664,27 +1705,48 @@ async function checkForUpdate(fromResume){
 }
 document.addEventListener("visibilitychange", () => { if (document.visibilityState==="visible") checkForUpdate(true); });
 setInterval(() => { if (document.visibilityState==="visible") checkForUpdate(false); }, 60000);
-A["reload-app"] = () => location.reload();
+A["reload-app"] = () => reloadApp();
 
 /* ---------- start ---------- */
 function startLocal(){
   stopAll(); st.mode = "local"; st.user = null; st.household = null; st.lists.ours = {};
   backend = localBackend(); render(true); scheduleRefresh();
 }
+function loadScript(src){
+  return new Promise((ok, fail) => { const el = document.createElement("script"); el.src = src; el.onload = ok; el.onerror = () => fail(new Error("load " + src)); document.body.appendChild(el); });
+}
 function init(){
+  if ("serviceWorker" in navigator && (location.protocol==="https:" || location.hostname==="localhost")) navigator.serviceWorker.register("sw.js").catch(()=>{});
   if (!HAS_FB || lsGet("wl.local")==="1"){ startLocal(); return; }
-  try {
-    firebase.initializeApp(FB_CFG);
-    auth = firebase.auth(); fs = firebase.firestore();
-    fs.enablePersistence({synchronizeTabs:true}).catch(()=>{});
-  } catch(e){ startLocal(); return; }
-  st.mode = "cloud"; render(true);
-  auth.getRedirectResult().catch(e => { st.authErr = authCopy(e); render(true); });
-  auth.onAuthStateChanged(u => {
+  st.mode = "cloud";
+  // 1. Show the saved view right away.
+  const snap = readSnap();
+  if (snap){
+    st.user = snap.user; st.household = snap.household || null; st.userDoc = snap.userDoc || {};
+    st.profile = {...DEF_PROFILE, ...(snap.profile||{})}; st.lists = {mine:snap.lists.mine||{}, ours:snap.lists.ours||{}};
+    st.ready = true; st.authReady = true; backend = cloudBackend();
+  }
+  render(true);
+  // 2. Then load Firebase and catch up.
+  fbReady = new Promise(res => requestAnimationFrame(() => setTimeout(res, 0)))
+    .then(() => loadScript("fb.js"))
+    .then(() => {
+      const emu = /^(localhost|127\.0\.0\.1)$/.test(location.hostname) && lsGet("wl.emu")==="1";
+      FBX = window.WLFB.start(FB_CFG, {emulator: emu}); auth = FBX.auth; fs = FBX.fs; return FBX;
+    });
+  fbReady.then(() => {
+    if (lsGet("wl.redirect")){ lsSet("wl.redirect", null); auth.getRedirectResult().catch(e => { st.authErr = authCopy(e); render(true); }); }
+    auth.onAuthStateChanged(u => {
+      st.authReady = true;
+      if (lsGet("wl.local")==="1") return;
+      if (u) startCloud(u);
+      else { stopAll(); clearSnap(); st.user = null; st.ready = false; st.mode = "cloud"; st.lists = {mine:{}, ours:{}}; st.household = null; render(true); }
+    });
+  }).catch(() => {
     st.authReady = true;
-    if (lsGet("wl.local")==="1") return;
-    if (u) startCloud(u);
-    else { stopAll(); st.user = null; st.ready = false; st.mode = "cloud"; st.lists = {mine:{}, ours:{}}; st.household = null; render(true); }
+    if (!st.user){ st.authErr = "Couldn't load sign-in. Check your connection and reopen the app."; }
+    else toast("You're offline. Changes will save when you're back online.");
+    render(true);
   });
 }
 init();
